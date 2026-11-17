@@ -1,8 +1,23 @@
 #include <winver.h>
 #include <winuser.h>
+#include "resource.h"
 
 1 ICON "topbar.ico"
 CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "topbar.manifest"
+
+// Power menu icons, the same ones as the wlogout menu on the Linux (Hyprland) setup.
+IDR_POWER_LOCK              RCDATA "power\\lock.png"
+IDR_POWER_LOCK_HOVER        RCDATA "power\\lock-hover.png"
+IDR_POWER_REBOOT            RCDATA "power\\reboot.png"
+IDR_POWER_REBOOT_HOVER      RCDATA "power\\reboot-hover.png"
+IDR_POWER_SHUTDOWN          RCDATA "power\\shutdown.png"
+IDR_POWER_SHUTDOWN_HOVER    RCDATA "power\\shutdown-hover.png"
+IDR_POWER_LOGOUT            RCDATA "power\\logout.png"
+IDR_POWER_LOGOUT_HOVER      RCDATA "power\\logout-hover.png"
+IDR_POWER_SUSPEND           RCDATA "power\\suspend.png"
+IDR_POWER_SUSPEND_HOVER     RCDATA "power\\suspend-hover.png"
+IDR_POWER_HIBERNATE         RCDATA "power\\hibernate.png"
+IDR_POWER_HIBERNATE_HOVER   RCDATA "power\\hibernate-hover.png"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION 0,1,0,0

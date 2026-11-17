@@ -1,5 +1,6 @@
 #pragma once
 #include "common.h"
+#include <wincodec.h>
 
 struct Config;
 
@@ -48,10 +49,19 @@ public:
     void SetTransform(const D2D1_MATRIX_3X2_F& m);
     void ResetTransform();
 
+    // Text in the UI font at an exact size (in the target's units), for surfaces that size their own text.
+    ComPtr<IDWriteTextFormat> CreateTextFormat(float size, DWRITE_FONT_WEIGHT weight = DWRITE_FONT_WEIGHT_NORMAL);
+    void Text(const std::wstring& s, IDWriteTextFormat* f, const D2D1_RECT_F& r, const Color& c, Align a = Align::Left);
+    float Measure(const std::wstring& s, IDWriteTextFormat* f);
+    float LineHeight(IDWriteTextFormat* f);
+
     // Premultiplied BGRA, top-down rows. Bitmaps belong to the opaque target.
     ComPtr<ID2D1Bitmap> CreateBitmap(const void* pixels, int w, int h);
+    // Decodes a PNG resource once and scales it (high-quality cubic) to each requested square size.
+    // These bitmaps belong to the see-through target. Returns false if the image can't be loaded.
+    bool LoadPngResource(HINSTANCE inst, int id, const int* sizes, int count, ComPtr<ID2D1Bitmap>* out);
 
-    void ReleaseAlphaTarget() { alpha_ = Target{}; }  // free the see-through surface after rare use
+    void ReleaseAlphaTarget() { alpha_ = Target{}; wic_.Reset(); }  // free the see-through surface after rare use
     unsigned Generation() const { return generation_; }  // bumps when bitmaps must be recreated
     const std::wstring& IconFamily() const { return iconFamily_; }
 
@@ -63,9 +73,12 @@ private:
     bool CreateTarget(Target& t, bool alpha);
     IDWriteTextFormat* Format(Font f);
     ComPtr<IDWriteTextLayout> Layout(const std::wstring& s, Font f, float maxW, float maxH);
+    ComPtr<IDWriteTextLayout> Layout(const std::wstring& s, IDWriteTextFormat* fmt, float maxW, float maxH);
 
     ComPtr<ID2D1Factory> factory_;
     ComPtr<IDWriteFactory> dwrite_;
+    ComPtr<IWICImagingFactory> wic_;
+    std::wstring textFamily_ = L"Segoe UI";
     Target opaque_, alpha_;
     ID2D1DCRenderTarget* rt_ = nullptr;          // current target while drawing
     ID2D1SolidColorBrush* brush_ = nullptr;

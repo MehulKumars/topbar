@@ -45,6 +45,7 @@ void Renderer::Shutdown() {
     for (auto& e : ellipsis_) e.Reset();
     opaque_ = Target{};
     alpha_ = Target{};
+    wic_.Reset();
     rt_ = nullptr;
     brush_ = nullptr;
     tabular_.Reset();
@@ -54,6 +55,7 @@ void Renderer::Shutdown() {
 
 void Renderer::SetFonts(const Config& cfg) {
     std::wstring text = FamilyExists(dwrite_.Get(), cfg.font) ? cfg.font : L"Segoe UI";
+    textFamily_ = text;
     iconFamily_ = cfg.iconFont;
     if (iconFamily_.empty() || !FamilyExists(dwrite_.Get(), iconFamily_))
         iconFamily_ = FamilyExists(dwrite_.Get(), L"Segoe Fluent Icons") ? L"Segoe Fluent Icons" : L"Segoe MDL2 Assets";
@@ -204,8 +206,11 @@ void Renderer::SetTransform(const D2D1_MATRIX_3X2_F& m) { rt_->SetTransform(m); 
 void Renderer::ResetTransform() { rt_->SetTransform(D2D1::Matrix3x2F::Identity()); }
 
 ComPtr<IDWriteTextLayout> Renderer::Layout(const std::wstring& s, Font f, float maxW, float maxH) {
+    return Layout(s, Format(f), maxW, maxH);
+}
+
+ComPtr<IDWriteTextLayout> Renderer::Layout(const std::wstring& s, IDWriteTextFormat* fmt, float maxW, float maxH) {
     ComPtr<IDWriteTextLayout> layout;
-    IDWriteTextFormat* fmt = Format(f);
     if (!fmt) return layout;
     dwrite_->CreateTextLayout(s.c_str(), (UINT32)s.size(), fmt, std::max(maxW, 1.f), std::max(maxH, 1.f), &layout);
     if (layout && tabular_) layout->SetTypography(tabular_.Get(), DWRITE_TEXT_RANGE{ 0, (UINT32)s.size() });
@@ -247,6 +252,45 @@ float Renderer::LineHeight(Font f) {
     return m.height;
 }
 
+ComPtr<IDWriteTextFormat> Renderer::CreateTextFormat(float size, DWRITE_FONT_WEIGHT weight) {
+    ComPtr<IDWriteTextFormat> fmt;
+    wchar_t locale[LOCALE_NAME_MAX_LENGTH] = L"en-us";
+    GetUserDefaultLocaleName(locale, LOCALE_NAME_MAX_LENGTH);
+    if (FAILED(dwrite_->CreateTextFormat(textFamily_.c_str(), nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
+                                         DWRITE_FONT_STRETCH_NORMAL, std::max(size, 1.f), locale, &fmt)))
+        return nullptr;
+    fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+    fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+    return fmt;
+}
+
+void Renderer::Text(const std::wstring& s, IDWriteTextFormat* f, const D2D1_RECT_F& r, const Color& c, Align a) {
+    if (s.empty() || !f) return;
+    auto layout = Layout(s, f, r.right - r.left, r.bottom - r.top);
+    if (!layout) return;
+    layout->SetTextAlignment(a == Align::Left ? DWRITE_TEXT_ALIGNMENT_LEADING
+                             : a == Align::Center ? DWRITE_TEXT_ALIGNMENT_CENTER : DWRITE_TEXT_ALIGNMENT_TRAILING);
+    brush_->SetColor(c.d2d());
+    rt_->DrawTextLayout(D2D1::Point2F(r.left, r.top), layout.Get(), brush_);
+}
+
+float Renderer::Measure(const std::wstring& s, IDWriteTextFormat* f) {
+    if (s.empty() || !f) return 0;
+    auto layout = Layout(s, f, 100000.f, 1000.f);
+    if (!layout) return 0;
+    DWRITE_TEXT_METRICS m{};
+    layout->GetMetrics(&m);
+    return m.widthIncludingTrailingWhitespace;
+}
+
+float Renderer::LineHeight(IDWriteTextFormat* f) {
+    auto layout = Layout(L"Ag", f, 1000.f, 1000.f);
+    if (!layout) return 16.f;
+    DWRITE_TEXT_METRICS m{};
+    layout->GetMetrics(&m);
+    return m.height;
+}
+
 void Renderer::Text(const std::wstring& s, Font f, const D2D1_RECT_F& r, const Color& c, Align a, bool ellipsis) {
     if (s.empty()) return;
     auto layout = Layout(s, f, r.right - r.left, r.bottom - r.top);
@@ -273,4 +317,63 @@ ComPtr<ID2D1Bitmap> Renderer::CreateBitmap(const void* pixels, int w, int h) {
         D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.f, 96.f);
     opaque_.rt->CreateBitmap(D2D1::SizeU((UINT32)w, (UINT32)h), pixels, (UINT32)w * 4, props, &bmp);
     return bmp;
+}
+
+bool Renderer::LoadPngResource(HINSTANCE inst, int id, const int* sizes, int count, ComPtr<ID2D1Bitmap>* out) {
+    if (!alpha_.rt && !CreateTarget(alpha_, true)) return false;
+    if (!wic_ && FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                         IID_PPV_ARGS(&wic_))))
+        return false;
+    HRSRC res = FindResourceW(inst, MAKEINTRESOURCEW(id), RT_RCDATA);
+    HGLOBAL mem = res ? LoadResource(inst, res) : nullptr;
+    void* data = mem ? LockResource(mem) : nullptr;
+    DWORD bytes = res ? SizeofResource(inst, res) : 0;
+    if (!data || !bytes) return false;
+
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapDecoder> decoder;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICFormatConverter> converter;
+    ComPtr<IWICBitmap> source;  // decoded once into memory
+    if (FAILED(wic_->CreateStream(&stream)) || FAILED(stream->InitializeFromMemory((BYTE*)data, bytes)) ||
+        FAILED(wic_->CreateDecoderFromStream(stream.Get(), nullptr, WICDecodeMetadataCacheOnDemand, &decoder)) ||
+        FAILED(decoder->GetFrame(0, &frame)) || FAILED(wic_->CreateFormatConverter(&converter)) ||
+        FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, nullptr,
+                                     0.f, WICBitmapPaletteTypeCustom)) ||
+        FAILED(wic_->CreateBitmapFromSource(converter.Get(), WICBitmapCacheOnLoad, &source)))
+        return false;
+
+    // Biggest size first, then each smaller one from the previous result: every step is a small
+    // reduction, which is both sharper and much faster than scaling the full image every time.
+    std::vector<int> order((size_t)count);
+    for (int i = 0; i < count; ++i) order[(size_t)i] = i;
+    std::sort(order.begin(), order.end(), [&](int a, int b) { return sizes[a] > sizes[b]; });
+    D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.f, 96.f);
+    std::vector<uint8_t> px;
+    for (int i : order) {
+        UINT s = (UINT)std::max(1, sizes[i]);
+        ComPtr<IWICBitmapScaler> scaler;
+        if (FAILED(wic_->CreateBitmapScaler(&scaler))) return false;
+        // High-quality cubic keeps small icons sharp; Fant is the fallback on older WIC.
+        if (FAILED(scaler->Initialize(source.Get(), s, s, WICBitmapInterpolationModeHighQualityCubic)) &&
+            FAILED(scaler->Initialize(source.Get(), s, s, WICBitmapInterpolationModeFant)))
+            return false;
+        px.resize((size_t)s * s * 4);
+        if (FAILED(scaler->CopyPixels(nullptr, s * 4, (UINT)px.size(), px.data()))) return false;
+        // Cubic filters can ring past the alpha edge; keep every pixel valid premultiplied colour.
+        for (size_t p = 0; p < px.size(); p += 4) {
+            uint8_t a = px[p + 3];
+            px[p] = std::min(px[p], a);
+            px[p + 1] = std::min(px[p + 1], a);
+            px[p + 2] = std::min(px[p + 2], a);
+        }
+        out[i].Reset();
+        if (FAILED(alpha_.rt->CreateBitmap(D2D1::SizeU(s, s), px.data(), s * 4, props, &out[i]))) return false;
+        ComPtr<IWICBitmap> next;
+        if (SUCCEEDED(wic_->CreateBitmapFromMemory(s, s, GUID_WICPixelFormat32bppPBGRA, s * 4, (UINT)px.size(),
+                                                   px.data(), &next)))
+            source = next;
+    }
+    return true;
 }

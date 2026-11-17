@@ -1049,7 +1049,7 @@ void App::PowerMenu(POINT pt) {
     DestroyMenu(m);
     switch (cmd) {
     case LOCK: LockWorkStation(); break;
-    case SLEEP: EnableShutdownPrivilege(); SetSuspendState(FALSE, FALSE, FALSE); break;
+    case SLEEP: SleepPC(*this); break;
     case HIBERNATE: EnableShutdownPrivilege(); SetSuspendState(TRUE, FALSE, FALSE); break;
     case SIGNOUT: ExitWindowsEx(EWX_LOGOFF, SHTDN_REASON_FLAG_PLANNED); break;
     case RESTART: EnableShutdownPrivilege(); ExitWindowsEx(EWX_REBOOT, SHTDN_REASON_FLAG_PLANNED); break;
@@ -1124,6 +1124,9 @@ bool App::AutostartEnabled() {
 // (and points at this exe, in case the folder moved) or is gone. A switch-off made in Task Manager's
 // Startup apps page is left alone.
 void App::SyncAutostart() {
+#ifdef TOPBAR_DRY_RUN
+    return;  // test builds run from elsewhere and must not take over the real install's autostart
+#endif
     std::wstring want = L"\"" + ExePath() + L"\"";
     wchar_t buf[MAX_PATH * 2] = L"";
     DWORD size = sizeof(buf);

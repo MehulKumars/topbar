@@ -26,13 +26,13 @@ set "CFLAGS=%CFLAGS% /Od /Zi /MTd /D_DEBUG"
 set "LFLAGS=/DEBUG"
 :build
 
-rc /nologo /fo build\topbar.res res\topbar.rc || exit /b 1
+rc /nologo /i res /fo build\topbar.res res\topbar.rc || exit /b 1
 
 cl %CFLAGS% /Fobuild\ /Fdbuild\ src\*.cpp build\topbar.res /Fe:build\TopBar.exe ^
   /link /SUBSYSTEM:WINDOWS /MANIFEST:NO /GUARD:CF %LFLAGS% ^
   user32.lib gdi32.lib shell32.lib ole32.lib oleaut32.lib uuid.lib advapi32.lib dwmapi.lib ^
   d2d1.lib dwrite.lib iphlpapi.lib wlanapi.lib bthprops.lib setupapi.lib pdh.lib shcore.lib ^
-  wtsapi32.lib powrprof.lib propsys.lib dxgi.lib delayimp.lib ^
+  wtsapi32.lib powrprof.lib propsys.lib dxgi.lib windowscodecs.lib delayimp.lib ^
   /DELAYLOAD:wlanapi.dll /DELAYLOAD:bthprops.cpl /DELAYLOAD:pdh.dll /DELAYLOAD:powrprof.dll || exit /b 1
 
 echo.

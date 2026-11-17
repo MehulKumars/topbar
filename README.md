@@ -4,7 +4,7 @@
 
 <p align="center"><b>A Waybar-style status bar for Windows 10 and 11 that stays out of your way.</b><br>
 Open apps on the left, the clock in the middle, your whole system at a glance on the right.<br>
-One 400 KB native exe. No installer, no admin rights, no drivers, no background services.</p>
+One native exe under 1 MB. No installer, no admin rights, no drivers, no background services.</p>
 
 ![TopBar across a 1440p screen](docs/bar.png)
 ![The right side of the bar: network speed, Ethernet, CPU with per-core bars and temperature, GPU, memory, disk, volume, Bluetooth, battery, power](docs/bar-right.png)
@@ -37,15 +37,21 @@ physical core with one bar per hardware thread.
 
 ## Power menu
 
-Click the power icon and the screen dims while big round buttons spring in one after another.
-Hover one and it grows and glows: the restart arrow spins, the moon rocks, the power icon pulses.
+The power menu is a copy of the [wlogout](https://github.com/ArtsyMacaw/wlogout) menu on the Hyprland
+setup this bar is modelled on, so switching between Linux and Windows feels the same. Click the power
+icon and the screen dims behind six icons. Hover one and it cross-fades to its coloured version while
+it springs bigger and its name turns pink. The icons, colours, layout and timing are wlogout's
+(`cubic-bezier(.55, 0, .28, 1.682)` over 0.3 s, and a 0.3 s fade in and out like Hyprland's).
 
-![The animated power menu](docs/power-menu.gif)
+![The power menu, hovering each button](docs/power-menu.gif)
 
-- **Lock, Sleep, Hibernate** and **Display off** (screen off while the PC keeps running, so downloads continue) are one click.
-- **Sign out, Restart and Shut down need a press-and-hold** while a ring fills, so a stray click can
-  never turn your PC off.
-- Arrow keys and Enter work too. Esc, right-click or a click outside closes it.
+- **Lock, Reboot, Shutdown, Logout, Suspend, Hibernate**: one click runs it, as in wlogout.
+  Hibernate only shows up when the PC has hibernation turned on.
+- **Keys** are wlogout's too: `L` lock, `R` reboot, `S` shutdown, `E` logout, `U` suspend, `H` hibernate.
+  Arrow keys or Tab move the focus and Enter picks it. Esc, right-click or a click on the dimmed
+  background closes the menu.
+- **Suspend on Modern Standby PCs** (most recent laptops) turns the display off, which is how Windows
+  itself goes into Modern Standby. The classic sleep call hibernates those PCs instead.
 
 ## Games and movies
 
@@ -170,6 +176,10 @@ build.cmd debug    :: debug build with symbols
 
 Every push is also built by GitHub Actions, and a `v*` tag publishes a release with the exe attached.
 
+To try the power menu safely, compile with `/DTOPBAR_DRY_RUN`: the buttons then only log their choice
+(with `--debug`, to `%TEMP%\topbar.log`) instead of locking, restarting or shutting down, and the
+build leaves the real install's *Start with Windows* entry alone.
+
 Source layout:
 
 | File | Purpose |
@@ -177,8 +187,14 @@ Source layout:
 | `src/app.cpp` | Controller: monitors, timers, fullscreen detection, peek, menus, tooltip text |
 | `src/bar.cpp` | One bar per monitor: appbar, layout, drawing, mouse; tooltip popup |
 | `src/stats.cpp` | CPU (busy time, per-core, clock speed), memory, network, GPU (D3DKMT), temperature, disks, battery, Wi-Fi, Bluetooth |
-| `src/power.cpp` | Animated power menu (spring animations, press-and-hold confirm) |
+| `src/power.cpp` | Power menu (wlogout layout, CSS-curve hover animations, Hyprland-style fade) |
 | `src/audio.cpp` | Default output volume (event driven) |
 | `src/winlist.cpp` | Open windows and their icons (including Store apps) |
 | `src/render.cpp` | Software Direct2D / DirectWrite renderer |
 | `src/config.cpp` | `topbar.ini` loading, defaults and live reload |
+| `res/power/` | Power menu icons (embedded in the exe) |
+
+## Credits
+
+The power menu icons are the wlogout icons from [JaKooLit's Hyprland-Dots](https://github.com/JaKooLit/Hyprland-Dots)
+(GPL-3.0), unchanged.
