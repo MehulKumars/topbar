@@ -114,7 +114,7 @@ TopBar.exe --debug     write a timing log to %TEMP%\topbar.log
 - **CPU usage** matches Task Manager by default. Since Windows 8, Task Manager shows *utility*:
   busy time scaled by the current clock speed relative to the base clock. So it reads lower than
   busy time when the CPU idles at low clocks and higher when it turbo-boosts. Set
-   for classic busy time (what Linux, Waybar and Resource Monitor show).
+  `cpu_usage = time` for classic busy time (what Linux, Waybar and Resource Monitor show).
   The CPU tooltip always shows both, plus the live clock speed.
 - **CPU temperature** comes from the ACPI thermal zone that Windows exposes without admin rights.
   On most laptops it tracks the CPU package. On some desktops it isn't available, and then it is hidden.
