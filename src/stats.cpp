@@ -202,7 +202,8 @@ void Stats::SampleFast() {
         }
     }
 
-    SampleCpuCounters();
+    if (useUtility || cpuCountersOn_) SampleCpuCounters();
+    else cpuCountersFresh = false;
     if (useUtility && utilityAvailable) {
         cpu = cpuUtility;
         cores = coresUtility.size() == coresBusy.size() ? coresUtility : coresBusy;
@@ -425,19 +426,39 @@ void Stats::InitCpuCounters() {
     pdhUtilEach_ = each;
     pdhPerf_ = perf;
     pdhFreq_ = freq;
+    utilityAvailable = true;
     PdhCollectQueryData(q);
+    cpuCountersLast_ = NowSeconds();
+}
+
+void Stats::SetCpuCountersActive(bool on) {
+    if (on && !cpuCountersOn_ && pdhCpuQuery_) {
+        // Take a baseline now; rates become valid on the next sample.
+        PdhCollectQueryData((PDH_HQUERY)pdhCpuQuery_);
+        cpuCountersLast_ = NowSeconds();
+        if (!useUtility) cpuCountersFresh = false;
+    }
+    cpuCountersOn_ = on;
+}
+
+void Stats::SampleCpuCountersIfStale() {
+    if ((cpuCountersOn_ || useUtility) && NowSeconds() - cpuCountersLast_ > 0.25) SampleCpuCounters();
 }
 
 void Stats::SampleCpuCounters() {
     if (!pdhCpuQuery_) return;
+    double now = NowSeconds();
+    bool hadBaseline = now - cpuCountersLast_ > 0.2;
     if (PdhCollectQueryData((PDH_HQUERY)pdhCpuQuery_) != ERROR_SUCCESS) return;
+    cpuCountersLast_ = now;
+    if (!hadBaseline) return;
+    cpuCountersFresh = true;
     auto valid = [](const PDH_FMT_COUNTERVALUE& v) {
         return v.CStatus == PDH_CSTATUS_VALID_DATA || v.CStatus == PDH_CSTATUS_NEW_DATA;
     };
     PDH_FMT_COUNTERVALUE v{};
     if (PdhGetFormattedCounterValue((PDH_HCOUNTER)pdhUtilTotal_, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, nullptr, &v) == ERROR_SUCCESS && valid(v)) {
         cpuUtility = Clamp01((float)(v.doubleValue / 100.0));
-        utilityAvailable = true;
     }
     if (pdhFreq_ && PdhGetFormattedCounterValue((PDH_HCOUNTER)pdhFreq_, PDH_FMT_DOUBLE, nullptr, &v) == ERROR_SUCCESS && valid(v))
         cpuBaseMHz = (float)v.doubleValue;

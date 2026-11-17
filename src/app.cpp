@@ -387,6 +387,7 @@ void App::Tick() {
     ++tickCount_;
     double t0 = NowSeconds();
     stats.sampleAllGpus = cfg.gpuSelect != L"auto" || tip.HitMod() == Mod::Gpu;
+    UpdateCpuCounterDemand();
     stats.SampleFast();
     double t1 = NowSeconds();
     RenderAll();
@@ -779,6 +780,13 @@ LRESULT App::Proc(UINT m, WPARAM w, LPARAM l) {
 
 // --- tooltips --------------------------------------------------------------------------------
 
+void App::UpdateCpuCounterDemand() {
+    bool want = tip.HitMod() == Mod::Cpu;
+    for (auto& b : bars)
+        if (b->hover >= 0 && b->hover < (int)b->hits.size() && b->hits[b->hover].mod == Mod::Cpu) want = true;
+    stats.SetCpuCountersActive(want);
+}
+
 void App::TurnDisplayOffSoon() {
     // A short delay so the click that chose it doesn't wake the screen straight back up.
     SetTimer(hwnd, T_DISPLAYOFF, 700, nullptr);
@@ -848,14 +856,17 @@ void App::BuildTooltip(const Hit& hit, std::wstring& title, std::vector<TipLine>
     }
     case Mod::Cpu: {
         title = s.cpuName;
+        lines.push_back({ L"Usage", pct(s.cpu) + (s.useUtility ? L"  (Task Manager method)" : L"") });
         if (s.utilityAvailable) {
-            lines.push_back({ s.useUtility ? L"Usage (Task Manager)" : L"Task Manager usage", pct(s.cpuUtility) });
-            lines.push_back({ L"Busy time", pct(s.cpuBusy) });
-        } else {
-            lines.push_back({ L"Usage", pct(s.cpu) });
+            if (!s.cpuCountersFresh) {
+                lines.push_back({ L"Clock speed", L"measuring\u2026" });
+            } else {
+                if (s.cpuMHz > 0)
+                    lines.push_back({ L"Clock speed", Fmt(L"%.2f GHz  (base %.2f GHz)", s.cpuMHz / 1000.f, s.cpuBaseMHz / 1000.f) });
+                if (s.useUtility) lines.push_back({ L"Busy time", pct(s.cpuBusy) });
+                else lines.push_back({ L"Task Manager", pct(s.cpuUtility) + L"  (busy time \u00D7 clock / base clock)" });
+            }
         }
-        if (s.cpuMHz > 0)
-            lines.push_back({ L"Speed", Fmt(L"%.2f GHz  (base %.2f GHz)", s.cpuMHz / 1000.f, s.cpuBaseMHz / 1000.f) });
         if (s.physicalCores) lines.push_back({ L"Cores", Fmt(L"%d cores, %d threads", s.physicalCores, s.logicalCpus) });
         extra.cpuHistory = s.cpuHistory.size() >= 2;
         extra.coreGrid = !s.cores.empty();

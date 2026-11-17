@@ -9,7 +9,11 @@
 extern bool g_debugLog;
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int) {
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    // The manifest already asks for per-monitor DPI awareness; this is a belt-and-braces call that is
+    // looked up at runtime so the exe still starts on early Windows 10 builds.
+    using SetCtx_t = BOOL(WINAPI*)(DPI_AWARENESS_CONTEXT);
+    if (auto fn = (SetCtx_t)GetProcAddress(GetModuleHandleW(L"user32.dll"), "SetProcessDpiAwarenessContext"))
+        fn(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     std::wstring args = ToLower(cmdLine ? cmdLine : L"");
     RemoteCommand cmd = (RemoteCommand)0;

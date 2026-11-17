@@ -577,6 +577,7 @@ LRESULT Bar::Proc(UINT m, WPARAM w, LPARAM l) {
         int idx = HitTest(GET_X_LPARAM(l), GET_Y_LPARAM(l));
         if (idx != hover) {
             hover = idx;
+            app_.UpdateCpuCounterDemand();
             Render();
             if (app_.tip.Visible()) {
                 if (idx >= 0) app_.tip.Show(this, hits[idx]);
@@ -593,6 +594,7 @@ LRESULT Bar::Proc(UINT m, WPARAM w, LPARAM l) {
         KillTimer(hwnd, T_TIP);
         HideTip(__LINE__);
         if (hover != -1) { hover = -1; Render(); }
+        app_.UpdateCpuCounterDemand();
         return 0;
     case WM_TIMER:
         if (w == T_TIP) {
@@ -671,6 +673,7 @@ void Tooltip::Show(Bar* bar, const Hit& hit) {
     owner_ = bar;
     hit_ = hit;
     visible_ = true;
+    if (hit.mod == Mod::Cpu) App::I->stats.SampleCpuCountersIfStale();
     Draw();
 }
 

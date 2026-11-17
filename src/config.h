@@ -25,7 +25,7 @@ struct Config {
     int intervalBatteryMs = 2000;
     bool netBits = false;
     bool cpuCoreBars = true;
-    bool cpuTaskManager = true;               // cpu_usage = taskmanager | time
+    bool cpuTaskManager = false;              // cpu_usage = time (default) | taskmanager
     std::wstring gpuSelect = L"auto";         // auto | all | <index>
 
     // [behavior]

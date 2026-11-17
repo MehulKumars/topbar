@@ -73,6 +73,10 @@ public:
     void ResetBaselines();  // call after a pause so the next rates are not averaged over the gap
     void RefreshBluetoothPresence();
     void RefreshGpuOutputs();
+    // The clock-speed / utility counters cost a little CPU, so they only run while something
+    // shows them (CPU tooltip open or hovered), unless cpu_usage = taskmanager.
+    void SetCpuCountersActive(bool on);
+    void SampleCpuCountersIfStale();
 
     // CPU
     std::wstring cpuName;
@@ -84,8 +88,9 @@ public:
     std::vector<float> coresBusy;
     float cpuUtility = 0;           // Task Manager's "% Processor Utility" (busy time scaled by clock speed)
     std::vector<float> coresUtility;
-    bool utilityAvailable = false;
-    bool useUtility = true;         // config: cpu_usage = taskmanager | time
+    bool utilityAvailable = false;  // the counters exist on this PC
+    bool cpuCountersFresh = false;  // utility / clock speed values are current
+    bool useUtility = false;        // config: cpu_usage = taskmanager
     float cpuMHz = 0, cpuBaseMHz = 0;
     std::vector<int> threadCore;    // logical processor -> physical core index
     std::vector<float> cpuHistory;  // last 60 samples of `cpu`, oldest first
@@ -141,6 +146,8 @@ private:
     void* pdhUtilEach_ = nullptr;
     void* pdhPerf_ = nullptr;
     void* pdhFreq_ = nullptr;
+    bool cpuCountersOn_ = false;
+    double cpuCountersLast_ = 0;
 
     // Thermal (PDH)
     void* pdhQuery_ = nullptr;

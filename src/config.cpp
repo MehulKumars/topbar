@@ -33,9 +33,9 @@ interval_battery_ms = 2000
 net_bits = 0
 ; Tiny per-core usage bars inside the CPU module
 cpu_core_bars = 1
-; taskmanager = same numbers as Task Manager (busy time scaled by clock speed)
-; time        = share of time the CPU was busy (what Linux / Waybar / Resource Monitor show)
-cpu_usage = taskmanager
+; time        = share of each second the cores were busy (the direct measurement; default)
+; taskmanager = Task Manager's "utility": busy time scaled by clock speed vs. base clock
+cpu_usage = time
 ; auto = the dedicated GPU (or the only one), all = every GPU, or an index 0,1,...
 gpu = auto
 
@@ -265,7 +265,7 @@ bool Config::Load() {
     {
         std::wstring mode;
         str(L"bar.cpu_usage", mode);
-        if (!mode.empty()) cpuTaskManager = ToLower(mode) != L"time";
+        if (!mode.empty()) cpuTaskManager = ToLower(mode) == L"taskmanager";
     }
     str(L"bar.gpu", gpuSelect);
     gpuSelect = ToLower(gpuSelect);
