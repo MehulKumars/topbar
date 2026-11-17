@@ -53,6 +53,8 @@ peek_seconds = 5
 game_apps =
 ; Run in Windows "efficiency mode" (lower CPU priority and power)
 efficiency_mode = 1
+; Start TopBar automatically when you sign in to Windows (no admin rights needed)
+start_with_windows = 1
 
 [clock]
 ; Date pattern: d dd ddd dddd, M MM MMM MMMM, yy yyyy
@@ -277,6 +279,7 @@ bool Config::Load() {
     num(L"behavior.peek_seconds", peekSeconds, 1, 120);
     list(L"behavior.game_apps", gameApps, true);
     boolean(L"behavior.efficiency_mode", efficiencyMode);
+    boolean(L"behavior.start_with_windows", startWithWindows);
 
     str(L"clock.date_format", dateFormat);
     boolean(L"clock.seconds", clockSeconds);

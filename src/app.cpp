@@ -21,6 +21,8 @@ const wchar_t* kControllerClass = L"TopBarController";
 const wchar_t* kBarClass = L"TopBarWnd";
 const wchar_t* kTipClass = L"TopBarTip";
 const wchar_t* kRunKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+// Where Task Manager's "Startup apps" stores its enable/disable switch for Run entries.
+const wchar_t* kStartupApprovedKey = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 
 DWORD WindowsBuild() {
     using RtlGetVersion_t = LONG(WINAPI*)(OSVERSIONINFOW*);
@@ -198,6 +200,7 @@ int App::Run(HINSTANCE instance, int command) {
     NotifyIpInterfaceChange(AF_UNSPEC, NetChangeCallback, hwnd, FALSE, &netNotify_);
 
     RegisterHotkey();
+    SyncAutostart();
     if (command == (int)RemoteCommand::Toggle) userHidden_ = true;
 
     // At logon Explorer may not be ready to host appbars yet; wait for it.
@@ -262,6 +265,7 @@ void App::ReloadConfig() {
 }
 
 void App::ApplyConfig() {
+    SyncAutostart();
     stats.useUtility = cfg.cpuTaskManager;
     renderer.SetFonts(cfg);
     UpdateMetrics();
@@ -1093,10 +1097,42 @@ void App::OverflowMenu(Bar& bar, POINT pt) {
     if (cmd >= 1 && cmd <= targets.size()) ActivateOrMinimize(targets[cmd - 1]);
 }
 
+bool App::AutostartDisabledByUser() {
+    BYTE data[16] = {};
+    DWORD size = sizeof(data);
+    if (RegGetValueW(HKEY_CURRENT_USER, kStartupApprovedKey, TOPBAR_NAME, RRF_RT_REG_BINARY, nullptr, data, &size) != ERROR_SUCCESS)
+        return false;
+    return size > 0 && (data[0] & 1) != 0;  // 02 = enabled, 03 = disabled in Task Manager
+}
+
+void App::ClearAutostartDisabled() {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kStartupApprovedKey, 0, KEY_SET_VALUE, &k) == ERROR_SUCCESS) {
+        RegDeleteValueW(k, TOPBAR_NAME);  // no entry = enabled
+        RegCloseKey(k);
+    }
+}
+
 bool App::AutostartEnabled() {
     wchar_t buf[MAX_PATH * 2];
     DWORD size = sizeof(buf);
-    return RegGetValueW(HKEY_CURRENT_USER, kRunKey, TOPBAR_NAME, RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS;
+    if (RegGetValueW(HKEY_CURRENT_USER, kRunKey, TOPBAR_NAME, RRF_RT_REG_SZ, nullptr, buf, &size) != ERROR_SUCCESS) return false;
+    return !AutostartDisabledByUser();
+}
+
+// The settings file is the source of truth. On every launch we make sure the startup entry exists
+// (and points at this exe, in case the folder moved) or is gone. A switch-off made in Task Manager's
+// Startup apps page is left alone.
+void App::SyncAutostart() {
+    std::wstring want = L"\"" + ExePath() + L"\"";
+    wchar_t buf[MAX_PATH * 2] = L"";
+    DWORD size = sizeof(buf);
+    bool exists = RegGetValueW(HKEY_CURRENT_USER, kRunKey, TOPBAR_NAME, RRF_RT_REG_SZ, nullptr, buf, &size) == ERROR_SUCCESS;
+    if (cfg.startWithWindows) {
+        if (!exists || _wcsicmp(buf, want.c_str()) != 0) SetAutostart(true);
+    } else if (exists) {
+        SetAutostart(false);
+    }
 }
 
 void App::SetAutostart(bool on) {
@@ -1142,7 +1178,13 @@ void App::ShowContextMenu(POINT pt) {
         cfg.SetValue(L"behavior", L"reveal_on_hover", cfg.revealOnHover ? L"0" : L"1");
         ReloadConfig();
         break;
-    case AUTOSTART: SetAutostart(!AutostartEnabled()); break;
+    case AUTOSTART: {
+        bool on = !AutostartEnabled();
+        if (on) ClearAutostartDisabled();  // an explicit tick also undoes a Task Manager switch-off
+        cfg.SetValue(L"behavior", L"start_with_windows", on ? L"1" : L"0");
+        ReloadConfig();  // re-syncs the startup entry
+        break;
+    }
     case EDIT:
         if ((INT_PTR)ShellExecuteW(nullptr, L"open", cfg.path.c_str(), nullptr, nullptr, SW_SHOWNORMAL) <= 32)
             ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + cfg.path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);

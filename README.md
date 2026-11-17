@@ -93,10 +93,15 @@ Yes. TopBar is built to adapt rather than assume:
 ## Install
 
 1. Download `TopBar.exe` from the [releases page](../../releases) (or build it, see below).
-2. Put it in a folder of your choice (for example `%LOCALAPPDATA%\TopBar`) and run it.
-3. Right-click an empty part of the bar and tick **Start with Windows**.
+2. Put it in a folder that will stay put (for example `%LOCALAPPDATA%\TopBar`) and run it.
 
-To remove it, untick **Start with Windows**, choose **Exit TopBar**, and delete the folder.
+That's it. TopBar **starts with Windows automatically**, so it comes back after restarts and
+Windows updates. It uses your account's normal startup list, so no admin rights are needed. If you
+move the folder, just run the exe once from the new place and the startup entry follows it.
+To turn auto-start off, right-click the bar and untick **Start with Windows** (or set
+`start_with_windows = 0`). A switch-off in Task Manager's *Startup apps* page is respected too.
+
+To remove TopBar completely: untick **Start with Windows**, choose **Exit TopBar**, and delete the folder.
 
 ## Settings
 
@@ -119,6 +124,7 @@ hide_in_fullscreen = 1
 reveal_on_hover = 1
 peek_hotkey = Ctrl+Alt+B
 game_apps =                    ; exe names that should always hide the bar, e.g. game.exe
+start_with_windows = 1         ; on by default
 
 [colors]
 background = #11111b           ; Catppuccin Mocha by default; any #rrggbb works

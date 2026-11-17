@@ -36,6 +36,7 @@ struct Config {
     int peekSeconds = 5;
     std::vector<std::wstring> gameApps;       // lowercase exe names that always hide the bar
     bool efficiencyMode = true;
+    bool startWithWindows = true;             // on by default; unticking it in the menu saves 0
 
     // [clock]
     std::wstring dateFormat = L"ddd d MMM";

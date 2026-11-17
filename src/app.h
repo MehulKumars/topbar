@@ -157,6 +157,9 @@ private:
     UINT TrackMenu(HMENU menu, POINT pt);
     bool AutostartEnabled();
     void SetAutostart(bool on);
+    void SyncAutostart();
+    static bool AutostartDisabledByUser();
+    static void ClearAutostartDisabled();
     bool AnyBarVisible() const;
     UINT CurrentInterval() const;
 
