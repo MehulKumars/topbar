@@ -127,6 +127,7 @@ public:
     // Module content & actions (used by bars/tooltips)
     void BuildTooltip(const Hit& hit, std::wstring& title, std::vector<TipLine>& lines, TipExtra& extra);
     void TurnDisplayOffSoon();
+    void TrimMemorySoon();
     void UpdateCpuCounterDemand();
     void OnModuleClick(Bar& bar, const Hit& hit, int button, POINT pt);
     void OnModuleWheel(const Hit& hit, int delta);

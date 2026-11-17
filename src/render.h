@@ -51,6 +51,7 @@ public:
     // Premultiplied BGRA, top-down rows. Bitmaps belong to the opaque target.
     ComPtr<ID2D1Bitmap> CreateBitmap(const void* pixels, int w, int h);
 
+    void ReleaseAlphaTarget() { alpha_ = Target{}; }  // free the see-through surface after rare use
     unsigned Generation() const { return generation_; }  // bumps when bitmaps must be recreated
     const std::wstring& IconFamily() const { return iconFamily_; }
 

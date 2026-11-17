@@ -780,6 +780,10 @@ LRESULT App::Proc(UINT m, WPARAM w, LPARAM l) {
 
 // --- tooltips --------------------------------------------------------------------------------
 
+void App::TrimMemorySoon() {
+    SetTimer(hwnd, T_TRIM, 3000, nullptr);
+}
+
 void App::UpdateCpuCounterDemand() {
     bool want = tip.HitMod() == Mod::Cpu;
     for (auto& b : bars)

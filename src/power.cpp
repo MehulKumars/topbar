@@ -490,6 +490,9 @@ void PowerOverlay::Run(App& app, const MonitorDesc& mon) {
         action = o.Run();
     }
     g_open = false;
+    // The menu is used rarely: drop its drawing surface and give the memory back to Windows.
+    app.renderer.ReleaseAlphaTarget();
+    app.TrimMemorySoon();
     switch (action) {
     case Action::Lock: LockWorkStation(); break;
     case Action::Sleep: EnableShutdownPrivilege(); SetSuspendState(FALSE, FALSE, FALSE); break;
