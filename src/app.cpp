@@ -3,6 +3,7 @@
 #include <ws2ipdef.h>
 #include <iphlpapi.h>
 #include "app.h"
+#include "power.h"
 #include <shellscalingapi.h>
 #include <wtsapi32.h>
 #include <powrprof.h>
@@ -13,7 +14,7 @@ App* App::I = nullptr;
 
 namespace {
 enum : UINT_PTR {
-    T_TICK = 1, T_SLOW, T_WATCH, T_WINLIST, T_DISPLAY, T_SHELLWAIT, T_PEEKEND, T_TRIM, T_NET, T_BTPRESENCE, T_RENDER
+    T_TICK = 1, T_SLOW, T_WATCH, T_WINLIST, T_DISPLAY, T_SHELLWAIT, T_PEEKEND, T_TRIM, T_NET, T_BTPRESENCE, T_RENDER, T_DISPLAYOFF
 };
 
 const wchar_t* kControllerClass = L"TopBarController";
@@ -58,18 +59,6 @@ void SendKeys(std::initializer_list<WORD> keys) {
         INPUT i{}; i.type = INPUT_KEYBOARD; i.ki.wVk = *it; i.ki.dwFlags = KEYEVENTF_KEYUP; in.push_back(i);
     }
     SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
-}
-
-void EnableShutdownPrivilege() {
-    HANDLE tok = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) return;
-    TOKEN_PRIVILEGES tp{};
-    tp.PrivilegeCount = 1;
-    if (LookupPrivilegeValueW(nullptr, SE_SHUTDOWN_NAME, &tp.Privileges[0].Luid)) {
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(tok, FALSE, &tp, 0, nullptr, nullptr);
-    }
-    CloseHandle(tok);
 }
 
 bool ParseHotkey(const std::wstring& text, UINT& mods, UINT& vk) {
@@ -191,6 +180,7 @@ int App::Run(HINSTANCE instance, int command) {
     ChangeWindowMessageFilterEx(hwnd, msgTaskbarCreated_, MSGFLT_ALLOW, nullptr);
     ChangeWindowMessageFilterEx(hwnd, WM_APP_COMMAND, MSGFLT_ALLOW, nullptr);
 
+    stats.useUtility = cfg.cpuTaskManager;
     stats.Init();
     audio.Init(hwnd);
 
@@ -272,6 +262,7 @@ void App::ReloadConfig() {
 }
 
 void App::ApplyConfig() {
+    stats.useUtility = cfg.cpuTaskManager;
     renderer.SetFonts(cfg);
     UpdateMetrics();
     RegisterHotkey();
@@ -309,7 +300,7 @@ void App::RebuildBars() {
     for (auto it = bars.begin(); it != bars.end();) {
         bool found = std::any_of(ctx.list.begin(), ctx.list.end(), [&](const MonitorDesc& d) { return d.device == (*it)->mon.device; });
         if (!found) {
-            if (tip.Owner() == it->get()) tip.Hide();
+            if (tip.Owner() == it->get()) tip.Hide(__LINE__);
             it = bars.erase(it);
         } else {
             ++it;
@@ -359,7 +350,7 @@ void App::ApplyVisibility() {
     }
     SetSampling(any);
     for (size_t i = 0; i < bars.size(); ++i) bars[i]->SetVisible(want[i]);
-    if (!any) tip.Hide();
+    if (!any) tip.Hide(__LINE__);
 }
 
 void App::SetSampling(bool on) {
@@ -630,6 +621,10 @@ LRESULT App::Proc(UINT m, WPARAM w, LPARAM l) {
         case T_TICK: Tick(); break;
         case T_SLOW: SlowTick(); break;
         case T_WATCH: Watch(); break;
+        case T_DISPLAYOFF:
+            KillTimer(hwnd, T_DISPLAYOFF);
+            DefWindowProcW(hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+            break;
         case T_RENDER:
             KillTimer(hwnd, T_RENDER);
             renderPending_ = false;
@@ -784,7 +779,12 @@ LRESULT App::Proc(UINT m, WPARAM w, LPARAM l) {
 
 // --- tooltips --------------------------------------------------------------------------------
 
-void App::BuildTooltip(const Hit& hit, std::wstring& title, std::vector<TipLine>& lines) {
+void App::TurnDisplayOffSoon() {
+    // A short delay so the click that chose it doesn't wake the screen straight back up.
+    SetTimer(hwnd, T_DISPLAYOFF, 700, nullptr);
+}
+
+void App::BuildTooltip(const Hit& hit, std::wstring& title, std::vector<TipLine>& lines, TipExtra& extra) {
     const Stats& s = stats;
     auto pct = [](float v) { return Fmt(L"%.0f%%", v * 100.f); };
     switch (hit.mod) {
@@ -848,12 +848,17 @@ void App::BuildTooltip(const Hit& hit, std::wstring& title, std::vector<TipLine>
     }
     case Mod::Cpu: {
         title = s.cpuName;
-        lines.push_back({ L"Usage", pct(s.cpu) });
-        if (s.physicalCores) lines.push_back({ L"Cores", Fmt(L"%d cores, %d threads", s.physicalCores, s.logicalCpus) });
-        if (!s.cores.empty()) {
-            size_t busiest = std::max_element(s.cores.begin(), s.cores.end()) - s.cores.begin();
-            lines.push_back({ L"Busiest thread", Fmt(L"#%zu at %.0f%%", busiest, s.cores[busiest] * 100.f) });
+        if (s.utilityAvailable) {
+            lines.push_back({ s.useUtility ? L"Usage (Task Manager)" : L"Task Manager usage", pct(s.cpuUtility) });
+            lines.push_back({ L"Busy time", pct(s.cpuBusy) });
+        } else {
+            lines.push_back({ L"Usage", pct(s.cpu) });
         }
+        if (s.cpuMHz > 0)
+            lines.push_back({ L"Speed", Fmt(L"%.2f GHz  (base %.2f GHz)", s.cpuMHz / 1000.f, s.cpuBaseMHz / 1000.f) });
+        if (s.physicalCores) lines.push_back({ L"Cores", Fmt(L"%d cores, %d threads", s.physicalCores, s.logicalCpus) });
+        extra.cpuHistory = s.cpuHistory.size() >= 2;
+        extra.coreGrid = !s.cores.empty();
         if (!std::isnan(s.cpuTemp))
             lines.push_back({ L"Temperature", Fmt(L"%.0f °C  (peak %.0f °C)", s.cpuTemp, s.cpuPeakTemp) });
         PERFORMANCE_INFORMATION pi{ sizeof(pi) };
@@ -924,7 +929,7 @@ void App::BuildTooltip(const Hit& hit, std::wstring& title, std::vector<TipLine>
     }
     case Mod::Power:
         title = L"Power";
-        lines.push_back({ L"", L"Lock, sleep, restart or shut down" });
+        lines.push_back({ L"", L"Click for the power menu \u00B7 Right-click for a quick list" });
         break;
     default:
         break;
@@ -936,7 +941,7 @@ void App::BuildTooltip(const Hit& hit, std::wstring& title, std::vector<TipLine>
 UINT App::TrackMenu(HMENU menu, POINT pt) {
     HWND prev = GetForegroundWindow();
     SetForegroundWindow(hwnd);
-    tip.Hide();
+    tip.Hide(__LINE__);
     UINT cmd = (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN,
                                       pt.x, pt.y, hwnd, nullptr);
     PostMessageW(hwnd, WM_NULL, 0, 0);
@@ -988,7 +993,13 @@ void App::OnModuleClick(Bar& bar, const Hit& hit, int button, POINT pt) {
         if (button == 0) { ShellOpen(L"ms-settings:batterysaver"); return; }
         break;
     case Mod::Power:
-        if (button == 0) { PowerMenu(pt); return; }
+        if (button == 0) {
+            MonitorDesc mon = bar.mon;  // copy: bars may be rebuilt while the menu is open
+            tip.Hide(__LINE__);
+            PowerOverlay::Run(*this, mon);
+            return;
+        }
+        if (button == 1) { PowerMenu(pt); return; }
         break;
     default:
         break;

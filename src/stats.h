@@ -78,8 +78,17 @@ public:
     std::wstring cpuName;
     int logicalCpus = 0;
     int physicalCores = 0;
-    float cpu = 0;                  // 0..1
-    std::vector<float> cores;       // 0..1 each
+    float cpu = 0;                  // 0..1, in the selected mode (Task Manager utility or busy time)
+    std::vector<float> cores;       // 0..1 per logical processor, selected mode
+    float cpuBusy = 0;              // share of time the CPUs were busy
+    std::vector<float> coresBusy;
+    float cpuUtility = 0;           // Task Manager's "% Processor Utility" (busy time scaled by clock speed)
+    std::vector<float> coresUtility;
+    bool utilityAvailable = false;
+    bool useUtility = true;         // config: cpu_usage = taskmanager | time
+    float cpuMHz = 0, cpuBaseMHz = 0;
+    std::vector<int> threadCore;    // logical processor -> physical core index
+    std::vector<float> cpuHistory;  // last 60 samples of `cpu`, oldest first
     float cpuTemp = NAN;
     float cpuPeakTemp = NAN;
 
@@ -110,6 +119,8 @@ private:
     void SampleGpuSlow();
     void InitThermal();
     void SampleThermal();
+    void InitCpuCounters();
+    void SampleCpuCounters();
 
     // CPU baselines
     uint64_t prevIdle_ = 0, prevKernel_ = 0, prevUser_ = 0;
@@ -123,6 +134,13 @@ private:
     uint64_t prevRx_ = 0, prevTx_ = 0;
     double prevNetTime_ = 0;
     bool netBaseline_ = false;
+
+    // CPU utility / frequency (PDH, same counters Task Manager uses)
+    void* pdhCpuQuery_ = nullptr;
+    void* pdhUtilTotal_ = nullptr;
+    void* pdhUtilEach_ = nullptr;
+    void* pdhPerf_ = nullptr;
+    void* pdhFreq_ = nullptr;
 
     // Thermal (PDH)
     void* pdhQuery_ = nullptr;

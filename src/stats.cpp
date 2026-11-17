@@ -39,7 +39,7 @@ std::wstring ReadCpuName() {
     return L"CPU";
 }
 
-int CountPhysicalCores() {
+int CountPhysicalCores(std::vector<int>& threadCore) {
     DWORD len = 0;
     GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
     if (!len) return 0;
@@ -47,9 +47,16 @@ int CountPhysicalCores() {
     auto* p = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)buf.data();
     if (!GetLogicalProcessorInformationEx(RelationProcessorCore, p, &len)) return 0;
     int count = 0;
+    threadCore.assign(64, -1);
     for (DWORD off = 0; off < len;) {
         auto* e = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*)(buf.data() + off);
-        if (e->Relationship == RelationProcessorCore) ++count;
+        if (e->Relationship == RelationProcessorCore) {
+            const GROUP_AFFINITY& ga = e->Processor.GroupMask[0];
+            if (ga.Group == 0)
+                for (int b = 0; b < 64; ++b)
+                    if (ga.Mask & (KAFFINITY(1) << b)) threadCore[b] = count;
+            ++count;
+        }
         off += e->Size;
     }
     return count;
@@ -92,7 +99,7 @@ bool DllAvailable(const wchar_t* name) {
 bool Stats::Init() {
     cpuName = ReadCpuName();
     logicalCpus = (int)GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    physicalCores = CountPhysicalCores();
+    physicalCores = CountPhysicalCores(threadCore);
     ntQuerySystemInformation_ = (void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation");
 
     wchar_t win[MAX_PATH];
@@ -107,6 +114,7 @@ bool Stats::Init() {
     }
     InitGpus();
     InitThermal();
+    InitCpuCounters();
 
     wlanAvailable_ = DllAvailable(L"wlanapi.dll");
     if (wlanAvailable_) {
@@ -138,6 +146,7 @@ void Stats::Shutdown() {
     }
     gpus.clear();
     if (pdhQuery_) { PdhCloseQuery((PDH_HQUERY)pdhQuery_); pdhQuery_ = nullptr; }
+    if (pdhCpuQuery_) { PdhCloseQuery((PDH_HQUERY)pdhCpuQuery_); pdhCpuQuery_ = nullptr; }
     if (wlan_) { WlanCloseHandle(wlan_, nullptr); wlan_ = nullptr; }
     if (nlm_) { ((INetworkListManager*)nlm_)->Release(); nlm_ = nullptr; }
 }
@@ -162,7 +171,7 @@ void Stats::SampleFast() {
         uint64_t idle = FtToU64(fi), kernel = FtToU64(fk), user = FtToU64(fu);
         if (prevKernel_ || prevUser_) {
             uint64_t dIdle = idle - prevIdle_, dTotal = (kernel - prevKernel_) + (user - prevUser_);
-            if (dTotal > 0) cpu = Clamp01(1.f - (float)dIdle / (float)dTotal);
+            if (dTotal > 0) cpuBusy = Clamp01(1.f - (float)dIdle / (float)dTotal);
         }
         prevIdle_ = idle; prevKernel_ = kernel; prevUser_ = user;
     }
@@ -177,21 +186,32 @@ void Stats::SampleFast() {
             auto* p = (SPPI*)coreBuf_.data();
             bool haveBase = (int)prevCoreTotal_.size() == count;
             if (!haveBase) { prevCoreIdle_.assign(count, 0); prevCoreTotal_.assign(count, 0); }
-            cores.resize(count);
+            coresBusy.resize(count);
             for (int i = 0; i < count; ++i) {
                 int64_t idle = p[i].IdleTime.QuadPart;
                 int64_t total = p[i].KernelTime.QuadPart + p[i].UserTime.QuadPart;
                 if (haveBase) {
                     int64_t dt = total - prevCoreTotal_[i], di = idle - prevCoreIdle_[i];
-                    cores[i] = dt > 0 ? Clamp01(1.f - (float)di / (float)dt) : 0.f;
+                    coresBusy[i] = dt > 0 ? Clamp01(1.f - (float)di / (float)dt) : 0.f;
                 } else {
-                    cores[i] = 0;
+                    coresBusy[i] = 0;
                 }
                 prevCoreIdle_[i] = idle;
                 prevCoreTotal_[i] = total;
             }
         }
     }
+
+    SampleCpuCounters();
+    if (useUtility && utilityAvailable) {
+        cpu = cpuUtility;
+        cores = coresUtility.size() == coresBusy.size() ? coresUtility : coresBusy;
+    } else {
+        cpu = cpuBusy;
+        cores = coresBusy;
+    }
+    cpuHistory.push_back(cpu);
+    if (cpuHistory.size() > 60) cpuHistory.erase(cpuHistory.begin());
 
     // Memory
     MEMORYSTATUSEX ms{ sizeof(ms) };
@@ -382,6 +402,67 @@ void Stats::SampleGpuSlow() {
             g.temp = NAN;
             g.tempSupported = false;
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// CPU utility and clock speed. Task Manager (Windows 8+) reports "% Processor Utility": busy time
+// scaled by the current clock relative to base clock. We read the same counters so the numbers match.
+
+void Stats::InitCpuCounters() {
+    PDH_HQUERY q = nullptr;
+    if (PdhOpenQueryW(nullptr, 0, &q) != ERROR_SUCCESS) return;
+    PDH_HCOUNTER total = nullptr, each = nullptr, perf = nullptr, freq = nullptr;
+    if (PdhAddEnglishCounterW(q, L"\\Processor Information(_Total)\\% Processor Utility", 0, &total) != ERROR_SUCCESS) {
+        PdhCloseQuery(q);
+        return;
+    }
+    if (PdhAddEnglishCounterW(q, L"\\Processor Information(*)\\% Processor Utility", 0, &each) != ERROR_SUCCESS) each = nullptr;
+    if (PdhAddEnglishCounterW(q, L"\\Processor Information(_Total)\\% Processor Performance", 0, &perf) != ERROR_SUCCESS) perf = nullptr;
+    if (PdhAddEnglishCounterW(q, L"\\Processor Information(_Total)\\Processor Frequency", 0, &freq) != ERROR_SUCCESS) freq = nullptr;
+    pdhCpuQuery_ = q;
+    pdhUtilTotal_ = total;
+    pdhUtilEach_ = each;
+    pdhPerf_ = perf;
+    pdhFreq_ = freq;
+    PdhCollectQueryData(q);
+}
+
+void Stats::SampleCpuCounters() {
+    if (!pdhCpuQuery_) return;
+    if (PdhCollectQueryData((PDH_HQUERY)pdhCpuQuery_) != ERROR_SUCCESS) return;
+    auto valid = [](const PDH_FMT_COUNTERVALUE& v) {
+        return v.CStatus == PDH_CSTATUS_VALID_DATA || v.CStatus == PDH_CSTATUS_NEW_DATA;
+    };
+    PDH_FMT_COUNTERVALUE v{};
+    if (PdhGetFormattedCounterValue((PDH_HCOUNTER)pdhUtilTotal_, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, nullptr, &v) == ERROR_SUCCESS && valid(v)) {
+        cpuUtility = Clamp01((float)(v.doubleValue / 100.0));
+        utilityAvailable = true;
+    }
+    if (pdhFreq_ && PdhGetFormattedCounterValue((PDH_HCOUNTER)pdhFreq_, PDH_FMT_DOUBLE, nullptr, &v) == ERROR_SUCCESS && valid(v))
+        cpuBaseMHz = (float)v.doubleValue;
+    if (pdhPerf_ && cpuBaseMHz > 0 &&
+        PdhGetFormattedCounterValue((PDH_HCOUNTER)pdhPerf_, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, nullptr, &v) == ERROR_SUCCESS && valid(v))
+        cpuMHz = (float)(cpuBaseMHz * v.doubleValue / 100.0);
+
+    if (!pdhUtilEach_) return;
+    DWORD size = 0, count = 0;
+    if (PdhGetFormattedCounterArrayW((PDH_HCOUNTER)pdhUtilEach_, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &size, &count, nullptr) != PDH_MORE_DATA)
+        return;
+    std::vector<uint8_t> buf(size);
+    auto* items = (PDH_FMT_COUNTERVALUE_ITEM_W*)buf.data();
+    if (PdhGetFormattedCounterArrayW((PDH_HCOUNTER)pdhUtilEach_, PDH_FMT_DOUBLE | PDH_FMT_NOCAP100, &size, &count, items) != ERROR_SUCCESS)
+        return;
+    coresUtility.assign(coresBusy.size(), 0.f);
+    for (DWORD i = 0; i < count; ++i) {
+        // Instance names are "group,index" plus "_Total" entries.
+        const wchar_t* name = items[i].szName;
+        if (!name || wcsstr(name, L"_Total") || !valid(items[i].FmtValue)) continue;
+        const wchar_t* comma = wcschr(name, L',');
+        if (!comma) continue;
+        int group = _wtoi(name), idx = _wtoi(comma + 1);
+        if (group == 0 && idx >= 0 && idx < (int)coresUtility.size())
+            coresUtility[idx] = Clamp01((float)(items[i].FmtValue.doubleValue / 100.0));
     }
 }
 

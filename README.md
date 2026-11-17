@@ -17,16 +17,24 @@ One 400 KB native exe. No installer, no admin rights, no drivers, no background 
 | **Clock** | Date and time in your Windows format | Calendar & notifications | Hover for week number, day of year, uptime |
 | **Net speed** | Live download / upload | Network flyout | Hover for totals since boot |
 | **Network** | Ethernet, Wi-Fi name and signal, or Offline | Network flyout | Hover for adapter, IP, link speed, internet status |
-| **CPU** | Usage, tiny per-core bars, temperature | Task Manager | Hover for cores, processes, peak temperature |
+| **CPU** | Usage (same numbers as Task Manager), tiny per-core bars, temperature | Task Manager | Hover for clock speed, a 1-minute graph and a live bar for every core and thread |
 | **GPU** | Usage and temperature (NVIDIA, AMD and Intel) | Task Manager | Hover for VRAM and every other GPU |
 | **Memory** | RAM usage % and GB | Task Manager | Hover for available and committed memory |
 | **Disk** | System drive usage | This PC | Hover for every drive |
 | **Volume** | Level / muted | Mute | Scroll to change, right-click for the mixer |
 | **Bluetooth** | On/off, connected device | Bluetooth settings | Hover for all connected devices |
 | **Battery** | Charge and charging state (laptops only) | Power settings | Hover for time left |
-| **Power** | | Lock, sleep, hibernate, sign out, restart, shut down | |
+| **Power** | | Animated power menu: lock, sleep, hibernate, display off, sign out, restart, shut down | Right-click for a quick list |
 
 Modules that don't apply to your PC (no battery, no Bluetooth, no Wi-Fi) hide themselves.
+
+## Power menu
+
+Click the power icon and the screen dims while big round buttons spring in one after another.
+Hover one and it grows and glows (the restart arrow spins, the moon rocks, the power icon pulses).
+Lock, Sleep, Hibernate and **Display off** (screen off, PC keeps running) are one click.
+**Sign out, Restart and Shut down need a press-and-hold** while a ring fills, so a stray click can
+never turn your PC off. Arrow keys + Enter work too, and Esc or a click outside closes it.
 
 ## Games and movies
 
@@ -103,6 +111,11 @@ TopBar.exe --debug     write a timing log to %TEMP%\topbar.log
 
 ## Notes
 
+- **CPU usage** matches Task Manager by default. Since Windows 8, Task Manager shows *utility*:
+  busy time scaled by the current clock speed relative to the base clock. So it reads lower than
+  busy time when the CPU idles at low clocks and higher when it turbo-boosts. Set
+   for classic busy time (what Linux, Waybar and Resource Monitor show).
+  The CPU tooltip always shows both, plus the live clock speed.
 - **CPU temperature** comes from the ACPI thermal zone that Windows exposes without admin rights.
   On most laptops it tracks the CPU package. On some desktops it isn't available, and then it is hidden.
 - **Wi-Fi name** needs *Location → Let desktop apps access your location* on Windows 11 24H2 and later.
@@ -125,7 +138,8 @@ Source layout:
 |---|---|
 | `src/app.cpp` | Controller: monitors, timers, fullscreen detection, peek, menus, tooltips text |
 | `src/bar.cpp` | One bar per monitor: appbar, layout, drawing, mouse; tooltip popup |
-| `src/stats.cpp` | CPU, memory, network, GPU (D3DKMT), temperature, disks, battery, Wi-Fi, Bluetooth |
+| `src/stats.cpp` | CPU (Task Manager utility + busy time), memory, network, GPU (D3DKMT), temperature, disks, battery, Wi-Fi, Bluetooth |
+| `src/power.cpp` | Animated power menu (spring animations, press-and-hold confirm) |
 | `src/audio.cpp` | Default output volume (event driven) |
 | `src/winlist.cpp` | Open windows and their icons (including Store apps) |
 | `src/render.cpp` | Software Direct2D / DirectWrite renderer |

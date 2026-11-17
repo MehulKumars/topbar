@@ -25,6 +25,10 @@ struct MonitorDesc {
 };
 
 struct TipLine { std::wstring label, value; };
+struct TipExtra {
+    bool cpuHistory = false;   // 60 s usage graph
+    bool coreGrid = false;     // live per-core / per-thread bars
+};
 
 class App;
 
@@ -39,7 +43,7 @@ public:
     void Reposition();
     void SetVisible(bool show);
     void Render();
-    void HideTip();
+    void HideTip(int line = 0);
 
     HWND hwnd = nullptr;
     MonitorDesc mon;
@@ -77,7 +81,7 @@ public:
     bool Create(HINSTANCE inst);
     void Show(Bar* bar, const Hit& hit);
     void Refresh();               // re-render with fresh values if visible
-    void Hide();
+    void Hide(int line = 0);
     bool Visible() const { return visible_; }
     Bar* Owner() const { return owner_; }
     Mod HitMod() const { return visible_ ? hit_.mod : Mod::None; }
@@ -91,6 +95,7 @@ private:
     HDC memDC_ = nullptr;
     HBITMAP dib_ = nullptr;
     HGDIOBJ oldBmp_ = nullptr;
+    int dibW_ = 0, dibH_ = 0;
     static LRESULT CALLBACK Proc(HWND h, UINT m, WPARAM w, LPARAM l);
 };
 
@@ -120,7 +125,8 @@ public:
     bool PeekActive() const;
 
     // Module content & actions (used by bars/tooltips)
-    void BuildTooltip(const Hit& hit, std::wstring& title, std::vector<TipLine>& lines);
+    void BuildTooltip(const Hit& hit, std::wstring& title, std::vector<TipLine>& lines, TipExtra& extra);
+    void TurnDisplayOffSoon();
     void OnModuleClick(Bar& bar, const Hit& hit, int button, POINT pt);
     void OnModuleWheel(const Hit& hit, int delta);
     void ShowContextMenu(POINT pt);

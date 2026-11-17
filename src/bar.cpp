@@ -327,13 +327,13 @@ void Bar::SetVisible(bool show) {
         Render();
         SetWindowPos(hwnd, HWND_TOPMOST, barRect.left, barRect.top, pxWidth, pxHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     } else {
-        HideTip();
+        HideTip(__LINE__);
         ShowWindow(hwnd, SW_HIDE);
     }
 }
 
-void Bar::HideTip() {
-    if (app_.tip.Owner() == this) app_.tip.Hide();
+void Bar::HideTip(int line) {
+    if (app_.tip.Owner() == this) app_.tip.Hide(line);
 }
 
 void Bar::EnsureSurface() {
@@ -534,7 +534,7 @@ void Bar::Render() {
 }
 
 void Bar::OnClick(int idx, int button, POINT pt) {
-    HideTip();
+    HideTip(__LINE__);
     if (idx < 0 || idx >= (int)hits.size()) {
         if (button == 1) app_.ShowContextMenu(pt);
         return;
@@ -580,7 +580,7 @@ LRESULT Bar::Proc(UINT m, WPARAM w, LPARAM l) {
             Render();
             if (app_.tip.Visible()) {
                 if (idx >= 0) app_.tip.Show(this, hits[idx]);
-                else app_.tip.Hide();
+                else app_.tip.Hide(__LINE__);
             } else {
                 KillTimer(hwnd, T_TIP);
                 if (idx >= 0) SetTimer(hwnd, T_TIP, 450, nullptr);
@@ -591,7 +591,7 @@ LRESULT Bar::Proc(UINT m, WPARAM w, LPARAM l) {
     case WM_MOUSELEAVE:
         tracking_ = false;
         KillTimer(hwnd, T_TIP);
-        HideTip();
+        HideTip(__LINE__);
         if (hover != -1) { hover = -1; Render(); }
         return 0;
     case WM_TIMER:
@@ -678,9 +678,9 @@ void Tooltip::Refresh() {
     if (visible_ && owner_) Draw();
 }
 
-void Tooltip::Hide() {
+void Tooltip::Hide(int line) {
     if (!hwnd) return;
-    if (visible_) ShowWindow(hwnd, SW_HIDE);
+    if (visible_) { ShowWindow(hwnd, SW_HIDE); DebugLog(L"tip hide line %d", line); }
     visible_ = false;
     owner_ = nullptr;
 }
@@ -689,40 +689,87 @@ void Tooltip::Draw() {
     App& a = *App::I;
     std::wstring title;
     std::vector<TipLine> lines;
-    a.BuildTooltip(hit_, title, lines);
-    if (title.empty() && lines.empty()) { Hide(); return; }
+    TipExtra extra;
+    a.BuildTooltip(hit_, title, lines, extra);
+    if (title.empty() && lines.empty()) { Hide(-1); return; }
     Renderer& r = a.renderer;
     const Theme& t = a.cfg.theme;
+    const Stats& st = a.stats;
     Bar& bar = *owner_;
     float s = bar.Scale();
 
-    const float pad = 12.f, colGap = 18.f, maxW = 560.f;
+    // The last line is a usage hint when it has no label; it goes at the very bottom.
+    std::wstring hint;
+    if (!lines.empty() && lines.back().label.empty()) { hint = lines.back().value; lines.pop_back(); }
+
+    const float pad = 12.f, colGap = 18.f, maxW = 620.f;
     if (title.size() > 90) title = title.substr(0, 87) + L"...";
     float titleH = r.LineHeight(Font::TipBold);
     float lineH = r.LineHeight(Font::Tip) + 3.f;
-    float labelW = 0, valueW = 0, hintW = 0;
+    float labelW = 0, valueW = 0;
     for (auto& ln : lines) {
-        if (ln.label.empty() && !ln.value.empty() && &ln == &lines.back()) hintW = std::max(hintW, r.Measure(ln.value, Font::Sub));
-        else { labelW = std::max(labelW, r.Measure(ln.label, Font::Tip)); valueW = std::max(valueW, r.Measure(ln.value, Font::Tip)); }
+        labelW = std::max(labelW, r.Measure(ln.label, Font::Tip));
+        valueW = std::max(valueW, r.Measure(ln.value, Font::Tip));
     }
-    float contentW = std::max({ r.Measure(title, Font::TipBold), labelW + colGap + valueW, hintW });
+    float contentW = std::max({ r.Measure(title, Font::TipBold), labelW + colGap + valueW, r.Measure(hint, Font::Sub) });
+
+    // Per-core grid: one row per physical core, one bar per hardware thread.
+    std::vector<std::vector<int>> coreRows;
+    float gridW = 0, rowW = 0, gridLabelW = 0, barW = 64.f, pctW = 0;
+    int gridCols = 1, rowsPerCol = 0;
+    const float rowH = 17.f, gridColGap = 22.f;
+    if (extra.coreGrid) {
+        int n = (int)st.cores.size();
+        bool mapped = st.physicalCores > 0 && (int)st.threadCore.size() >= n;
+        for (int i = 0; i < n && mapped; ++i) if (st.threadCore[i] < 0) mapped = false;
+        if (mapped) {
+            coreRows.assign(st.physicalCores, {});
+            for (int i = 0; i < n; ++i)
+                if (st.threadCore[i] < st.physicalCores) coreRows[st.threadCore[i]].push_back(i);
+            coreRows.erase(std::remove_if(coreRows.begin(), coreRows.end(), [](auto& v) { return v.empty(); }), coreRows.end());
+        } else {
+            for (int i = 0; i < n; ++i) coreRows.push_back({ i });
+        }
+        size_t maxThreads = 1;
+        for (auto& row : coreRows) maxThreads = std::max(maxThreads, row.size());
+        if (maxThreads == 1) barW = 110.f;
+        gridLabelW = r.Measure(mapped ? L"Core 00" : L"CPU 00", Font::Tip);
+        pctW = r.Measure(L"100%", Font::Tip);
+        rowW = gridLabelW + 10.f + maxThreads * (barW + 6.f + pctW) + (maxThreads - 1) * 12.f;
+        gridCols = coreRows.size() > 8 ? 2 : 1;
+        rowsPerCol = (int)((coreRows.size() + gridCols - 1) / gridCols);
+        gridW = gridCols * rowW + (gridCols - 1) * gridColGap;
+        contentW = std::max(contentW, gridW);
+    }
+    if (extra.cpuHistory) contentW = std::max(contentW, 300.f);
     contentW = std::min(contentW, maxW);
+
+    const float sectionH = 18.f, chartH = 46.f;
+    float h = pad + titleH;
+    if (!lines.empty()) h += 8.f + lines.size() * lineH;
+    if (extra.cpuHistory) h += 8.f + sectionH + chartH;
+    if (!coreRows.empty()) h += 8.f + sectionH + rowsPerCol * rowH;
+    if (!hint.empty()) h += 6.f + lineH;
+    h += pad - 2.f;
     float w = contentW + pad * 2;
-    float h = pad + titleH + (lines.empty() ? 0 : 8.f + lines.size() * lineH) + pad - 2.f;
 
     int pw = (int)std::ceil(w * s), ph = (int)std::ceil(h * s);
-    BITMAPINFO bi{};
-    bi.bmiHeader = { sizeof(BITMAPINFOHEADER), pw, -ph, 1, 32, BI_RGB };
     if (!memDC_) {
         HDC screen = GetDC(nullptr);
         memDC_ = CreateCompatibleDC(screen);
         ReleaseDC(nullptr, screen);
     }
-    if (oldBmp_) SelectObject(memDC_, oldBmp_);
-    if (dib_) DeleteObject(dib_);
-    void* bits = nullptr;
-    dib_ = CreateDIBSection(memDC_, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    oldBmp_ = SelectObject(memDC_, dib_);
+    if (!dib_ || dibW_ != pw || dibH_ != ph) {
+        if (oldBmp_) SelectObject(memDC_, oldBmp_);
+        if (dib_) DeleteObject(dib_);
+        BITMAPINFO bi{};
+        bi.bmiHeader = { sizeof(BITMAPINFOHEADER), pw, -ph, 1, 32, BI_RGB };
+        void* bits = nullptr;
+        dib_ = CreateDIBSection(memDC_, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+        oldBmp_ = SelectObject(memDC_, dib_);
+        dibW_ = pw;
+        dibH_ = ph;
+    }
 
     if (!r.Begin(memDC_, pw, ph, (float)bar.mon.dpi)) return;
     r.Clear(t.pill);
@@ -730,20 +777,57 @@ void Tooltip::Draw() {
     float y = pad - 2.f;
     r.Text(title, Font::TipBold, { pad, y, pad + contentW, y + titleH }, t.text, Align::Left, true);
     y += titleH + 4.f;
+    auto separator = [&] { r.FillRect({ pad, y, w - pad, y + 1.f / s }, t.pillActive); y += 4.f; };
     if (!lines.empty()) {
-        r.FillRect({ pad, y, w - pad, y + 1.f / s }, t.pillActive);
-        y += 4.f;
-        for (size_t i = 0; i < lines.size(); ++i) {
-            const TipLine& ln = lines[i];
-            bool hint = ln.label.empty() && i + 1 == lines.size();
-            if (hint) {
-                r.Text(ln.value, Font::Sub, { pad, y, pad + contentW, y + lineH }, t.subtext, Align::Left, true);
-            } else {
-                r.Text(ln.label, Font::Tip, { pad, y, pad + labelW, y + lineH }, t.subtext, Align::Left, true);
-                r.Text(ln.value, Font::Tip, { pad + labelW + colGap, y, pad + contentW, y + lineH }, t.text, Align::Left, true);
-            }
+        separator();
+        for (auto& ln : lines) {
+            r.Text(ln.label, Font::Tip, { pad, y, pad + labelW, y + lineH }, t.subtext, Align::Left, true);
+            r.Text(ln.value, Font::Tip, { pad + labelW + colGap, y, pad + contentW, y + lineH }, t.text, Align::Left, true);
             y += lineH;
         }
+    }
+    if (extra.cpuHistory) {
+        y += 4.f;
+        r.Text(L"Last minute", Font::Sub, { pad, y, pad + contentW, y + sectionH }, t.subtext);
+        y += sectionH;
+        D2D1_RECT_F chart{ pad, y, pad + contentW, y + chartH };
+        r.FillRound(chart, 4.f, t.background);
+        r.FillRect({ chart.left, (chart.top + chart.bottom) / 2, chart.right, (chart.top + chart.bottom) / 2 + 1.f / s }, t.pillHover);
+        D2D1_RECT_F inner{ chart.left + 1.f, chart.top + 3.f, chart.right - 1.f, chart.bottom - 1.f };
+        r.AreaChart(inner, st.cpuHistory, 60, t.cpu, t.cpu.WithAlpha(0.22f));
+        y += chartH;
+    }
+    if (!coreRows.empty()) {
+        y += 4.f;
+        r.Text(st.physicalCores > 0 && coreRows.size() == (size_t)st.physicalCores ? L"Per core  (each bar is one thread)" : L"Per CPU",
+               Font::Sub, { pad, y, pad + contentW, y + sectionH }, t.subtext);
+        y += sectionH;
+        bool mapped = coreRows.size() == (size_t)st.physicalCores && st.physicalCores > 0;
+        for (size_t ri = 0; ri < coreRows.size(); ++ri) {
+            int col = (int)(ri / rowsPerCol), row = (int)(ri % rowsPerCol);
+            float x = pad + col * (rowW + gridColGap), ry = y + row * rowH;
+            r.Text(Fmt(mapped ? L"Core %zu" : L"CPU %d", mapped ? ri + 1 : (size_t)coreRows[ri][0]), Font::Tip,
+                   { x, ry, x + gridLabelW, ry + rowH }, t.subtext);
+            x += gridLabelW + 10.f;
+            for (int lp : coreRows[ri]) {
+                float v = lp < (int)st.cores.size() ? st.cores[lp] : 0.f;
+                float cy = ry + rowH / 2;
+                D2D1_RECT_F bg{ x, cy - 3.5f, x + barW, cy + 3.5f };
+                r.FillRound(bg, 2.f, t.pillActive);
+                if (v > 0.005f) {
+                    Color c = v < 0.6f ? t.cpu : (v < 0.85f ? t.warn : t.hot);
+                    r.FillRound({ bg.left, bg.top, bg.left + std::max(3.f, barW * v), bg.bottom }, 2.f, c);
+                }
+                r.Text(Fmt(L"%.0f%%", v * 100.f), Font::Tip, { x + barW + 6.f, ry, x + barW + 6.f + pctW, ry + rowH },
+                       v >= 0.85f ? t.hot : t.text, Align::Right);
+                x += barW + 6.f + pctW + 12.f;
+            }
+        }
+        y += rowsPerCol * rowH;
+    }
+    if (!hint.empty()) {
+        y += 6.f;
+        r.Text(hint, Font::Sub, { pad, y, pad + contentW, y + lineH }, t.subtext, Align::Left, true);
     }
     r.End();
 
