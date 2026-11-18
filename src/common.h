@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cwchar>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -37,9 +38,11 @@ enum : UINT {
     WM_APP_AUDIO_DEVICE,          // default audio device changed
     WM_APP_NETCHANGE,             // network interface changed
     WM_APP_COMMAND,               // command from a second instance (wParam = command id)
+    WM_APP_PET,                   // pet sprite decoded (wParam = generation, lParam = PetLoad*)
+    WM_APP_WALLPAPER,             // wallpaper palette ready (wParam = generation, lParam = WallpaperResult*)
 };
 
-enum class RemoteCommand : WPARAM { Exit = 1, Toggle = 2, Reload = 3 };
+enum class RemoteCommand : WPARAM { Exit = 1, Toggle = 2, Reload = 3, Snapshot = 4 /* test builds only */ };
 
 inline float Clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
 
@@ -74,5 +77,13 @@ bool ParseColor(const std::wstring& s, Color& out);
 
 // High resolution clock in seconds.
 double NowSeconds();
+
+// Runs `job` once on a short-lived, low-priority worker thread with COM (MTA) initialised.
+// The job must only use what it captured by value and report back with PostMessage.
+bool RunInBackground(std::function<void()> job);
+
+// Ease-out cubic, and Windows' "Show animations" setting (Settings > Accessibility > Visual effects).
+inline float EaseOut(float t) { t = Clamp01(t); float u = 1.f - t; return 1.f - u * u * u; }
+bool SystemAnimationsEnabled();
 
 void DebugLog(const wchar_t* fmt, ...);

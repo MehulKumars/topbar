@@ -1,24 +1,23 @@
-// A bar on one monitor: appbar registration, layout, drawing and input. Plus the tooltip popup.
+// A bar on one monitor: appbar registration, layout, drawing and input, hover fades, and the pet
+// drawn over the bar's empty space. The tooltip cards live in tooltip.cpp.
 #include "app.h"
 
 namespace {
 
-enum : UINT_PTR { T_TIP = 10 };
+enum : UINT_PTR { T_TIP = 10, T_TIPHIDE, T_ANIM };
 
-// Segoe Fluent Icons / Segoe MDL2 Assets code points.
-constexpr wchar_t G_CPU = 0xE950, G_GPU = 0xE7F4, G_MEM = 0xE964, G_DISK = 0xEDA2, G_TEMP = 0xE9CA;
-constexpr wchar_t G_DOWN = 0xE896, G_UP = 0xE898, G_ETH = 0xE839, G_OFFLINE = 0xE871, G_BT = 0xE702;
-constexpr wchar_t G_MUTE = 0xE74F, G_POWER = 0xE7E8, G_VPN = 0xE705;
-constexpr wchar_t G_WIFI[4] = { 0xE872, 0xE873, 0xE874, 0xE701 };
-constexpr wchar_t G_VOL[4] = { 0xE992, 0xE993, 0xE994, 0xE995 };
+constexpr wchar_t G_CPU = glyph::Cpu, G_GPU = glyph::Gpu, G_MEM = glyph::Mem, G_DISK = glyph::Disk, G_TEMP = glyph::Temp;
+constexpr wchar_t G_DOWN = glyph::Down, G_UP = glyph::Up, G_ETH = glyph::Eth, G_OFFLINE = glyph::Offline, G_BT = glyph::Bt;
+constexpr wchar_t G_MUTE = glyph::Mute, G_POWER = glyph::Power, G_VPN = glyph::Vpn;
+const wchar_t* const G_WIFI = glyph::Wifi;
 
-wchar_t BatteryGlyph(int pct, bool charging) {
-    int i = std::clamp((pct + 5) / 10, 0, 10);
-    if (charging) {
-        if (i <= 8) return (wchar_t)(0xE85A + i);
-        return i == 9 ? (wchar_t)0xE83E : (wchar_t)0xEA93;
-    }
-    return i < 10 ? (wchar_t)(0xE850 + i) : (wchar_t)0xE83F;
+constexpr float kHoverSeconds = 0.14f;  // hover highlight fade
+
+// Premultiplied source-over (the destination's alpha is ignored: the bar is opaque).
+inline uint32_t Over(uint32_t s, uint32_t d) {
+    uint32_t ia = 255 - (s >> 24);
+    auto ch = [&](int sh) { return (((s >> sh) & 255) + (((d >> sh) & 255) * ia + 127) / 255) & 255; };
+    return 0xFF000000u | (ch(16) << 16) | (ch(8) << 8) | ch(0);
 }
 
 struct Span {
@@ -97,8 +96,6 @@ void DrawSpans(Renderer& r, const Theme& t, const Spans& spans, float x, float t
         x += w;
     }
 }
-
-Color TempColor(const Theme& t, float c) { return c >= 85 ? t.hot : (c >= 72 ? t.warn : t.temp); }
 
 std::wstring ClockTime(const Config& cfg, const SYSTEMTIME& st) {
     wchar_t buf[64];
@@ -205,7 +202,7 @@ Spans BuildSpans(App& a, Mod mod) {
         if (!a.audio.present) break;
         if (a.audio.muted) { icon(G_MUTE, t.subtext); text(L"Muted", t.subtext); break; }
         float l = a.audio.level;
-        icon(G_VOL[l <= 0.001f ? 0 : l < 0.34f ? 1 : l < 0.67f ? 2 : 3], t.volume);
+        icon(glyph::Volume(l), t.volume);
         text(pct(l), t.text, a.wPct);
         break;
     }
@@ -226,7 +223,7 @@ Spans BuildSpans(App& a, Mod mod) {
         const BatteryInfo& b = s.battery;
         if (!b.present || b.percent < 0) break;
         Color c = b.charging || b.onAC ? t.battery : (b.percent <= 15 ? t.hot : (b.percent <= 30 ? t.warn : t.battery));
-        icon(BatteryGlyph(b.percent, b.charging), c);
+        icon(glyph::Battery(b.percent, b.charging), c);
         text(Fmt(L"%d%%", b.percent), b.percent <= 15 && !b.onAC ? t.hot : t.text, a.wPct);
         break;
     }
@@ -248,6 +245,8 @@ Bar::Bar(App& app, const MonitorDesc& m) : mon(m), app_(app) {}
 Bar::~Bar() {
     if (hwnd) {
         KillTimer(hwnd, T_TIP);
+        KillTimer(hwnd, T_TIPHIDE);
+        KillTimer(hwnd, T_ANIM);
         UnregisterAppBar();
         DestroyWindow(hwnd);
         hwnd = nullptr;
@@ -346,9 +345,11 @@ void Bar::EnsureSurface() {
     bi.bmiHeader = { sizeof(BITMAPINFOHEADER), std::max(pxWidth, 1), -std::max(pxHeight, 1), 1, 32, BI_RGB };
     void* bits = nullptr;
     dib_ = CreateDIBSection(memDC_, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    bits_ = (uint32_t*)bits;
     oldBmp_ = SelectObject(memDC_, dib_);
-    surfW_ = pxWidth;
-    surfH_ = pxHeight;
+    surfW_ = std::max(pxWidth, 1);
+    surfH_ = std::max(pxHeight, 1);
+    petDrawn_ = false;
 }
 
 void Bar::FreeSurface() {
@@ -358,7 +359,126 @@ void Bar::FreeSurface() {
         memDC_ = nullptr;
     }
     if (dib_) { DeleteObject(dib_); dib_ = nullptr; }
+    bits_ = nullptr;
+    petDrawn_ = false;
     surfW_ = surfH_ = 0;
+}
+
+// --- Hover fades ------------------------------------------------------------------------------
+
+float Bar::HoverLevel(Mod m, HWND h, double now) const {
+    for (const Fade& f : fades_)
+        if (f.mod == m && f.hwnd == h) return f.from + (f.to - f.from) * EaseOut((float)((now - f.start) / kHoverSeconds));
+    return 0.f;
+}
+
+bool Bar::FadesBusy(double now) const {
+    for (const Fade& f : fades_)
+        if (now - f.start < kHoverSeconds) return true;
+    return false;
+}
+
+void Bar::SetHover(int idx) {
+    double now = NowSeconds();
+    bool anim = app_.Animations();
+    auto aim = [&](Mod m, HWND h, float to) {
+        float cur = HoverLevel(m, h, now);
+        for (Fade& f : fades_)
+            if (f.mod == m && f.hwnd == h) { f = { m, h, anim ? cur : to, to, now }; return; }
+        fades_.push_back({ m, h, anim ? 0.f : to, to, now });
+    };
+    if (hover >= 0 && hover < (int)hits.size()) aim(hits[hover].mod, hits[hover].hwnd, 0.f);
+    hover = idx;
+    if (idx >= 0 && idx < (int)hits.size()) aim(hits[idx].mod, hits[idx].hwnd, 1.f);
+    if (!anim) {
+        fades_.erase(std::remove_if(fades_.begin(), fades_.end(), [](const Fade& f) { return f.to == 0.f; }), fades_.end());
+        return;
+    }
+    if (!animating_) {
+        animating_ = true;
+        SetTimer(hwnd, T_ANIM, 10, nullptr);
+    }
+}
+
+// --- Pet ----------------------------------------------------------------------------------------
+
+bool Bar::PetSpan(const std::wstring& area, float petCenter, float petWidth, float& left, float& right) const {
+    const float m = 8.f;  // keep clear of the modules on either side
+    float l0 = gapL_[0] + m, r0 = gapR_[0] - m, l1 = gapL_[1] + m, r1 = gapR_[1] - m;
+    bool fit0 = r0 - l0 >= petWidth + 2.f, fit1 = r1 - l1 >= petWidth + 2.f;
+    int pick;
+    if (area == L"left") pick = 0;
+    else if (area == L"right") pick = 1;
+    else if (petCenter >= l0 && petCenter <= r0 && fit0) pick = 0;  // stay where it is while it fits
+    else if (petCenter >= l1 && petCenter <= r1 && fit1) pick = 1;
+    else pick = (r0 - l0) >= (r1 - l1) ? 0 : 1;
+    left = pick ? l1 : l0;
+    right = pick ? r1 : r0;
+    return pick ? fit1 : fit0;
+}
+
+void Bar::PetErase() {
+    if (!petDrawn_ || !bits_) { petDrawn_ = false; return; }
+    int w = petRect_.right - petRect_.left;
+    for (int y = petRect_.top; y < petRect_.bottom; ++y)
+        memcpy(bits_ + (size_t)y * surfW_ + petRect_.left, petBackup_.data() + (size_t)(y - petRect_.top) * w, (size_t)w * 4);
+    petDrawn_ = false;
+}
+
+void Bar::PetDraw() {
+    const Pet& p = app_.pet;
+    if (!bits_ || !p.shown || !p.sprite || p.frame >= p.sprite->frames.size()) return;
+    const PetSprite& sp = *p.sprite;
+    RECT want{ p.x, p.y, p.x + sp.w, p.y + sp.h }, surf{ 0, 0, surfW_, surfH_ };
+    if (!IntersectRect(&petRect_, &want, &surf)) return;
+    int w = petRect_.right - petRect_.left;
+    petBackup_.resize((size_t)w * (petRect_.bottom - petRect_.top));
+    const std::vector<uint32_t>& px = sp.frames[p.frame].px;
+    for (int y = petRect_.top; y < petRect_.bottom; ++y) {
+        uint32_t* row = bits_ + (size_t)y * surfW_;
+        memcpy(petBackup_.data() + (size_t)(y - petRect_.top) * w, row + petRect_.left, (size_t)w * 4);
+        const uint32_t* src = px.data() + (size_t)(y - p.y) * sp.w;
+        for (int x = petRect_.left; x < petRect_.right; ++x) {
+            int sx = x - p.x;
+            uint32_t s = src[p.mirrored ? sp.w - 1 - sx : sx], a = s >> 24;
+            if (a == 255) row[x] = s;
+            else if (a) row[x] = Over(s, row[x]);
+        }
+    }
+    petDrawn_ = true;
+}
+
+void Bar::Blit(const RECT& r) {
+    if (!visible || !memDC_ || IsRectEmpty(&r)) return;
+    HDC dc = GetDC(hwnd);
+    BitBlt(dc, r.left, r.top, r.right - r.left, r.bottom - r.top, memDC_, r.left, r.top, SRCCOPY);
+    ReleaseDC(hwnd, dc);
+}
+
+// One pet frame: put back the pixels it covered, draw it at its new place, and copy just the
+// rectangle around both to the screen. A few thousand pixels, no layout, no text.
+void Bar::PetUpdate() {
+    if (!memDC_) return;
+    GdiFlush();
+    RECT before = petDrawn_ ? petRect_ : RECT{};
+    PetErase();
+    PetDraw();
+    RECT after = petDrawn_ ? petRect_ : RECT{}, dirty{};
+    UnionRect(&dirty, &before, &after);
+    Blit(dirty);
+}
+
+void Bar::PetClear() {
+    if (!petDrawn_) return;
+    GdiFlush();
+    RECT before = petRect_;
+    PetErase();
+    Blit(before);
+}
+
+bool Bar::PetHitTest(int px, int py) const {
+    POINT pt{ px, py };
+    return petDrawn_ && PtInRect(&petRect_, pt);
 }
 
 int Bar::HitTest(int px, int py) const {
@@ -386,7 +506,12 @@ void Bar::Render() {
     HWND hoverHwnd = nullptr;
     if (hover >= 0 && hover < (int)hits.size()) { hoverMod = hits[hover].mod; hoverHwnd = hits[hover].hwnd; }
     std::vector<Hit> newHits;
-    auto isHover = [&](Mod m, HWND h) { return m == hoverMod && h == hoverHwnd; };
+    double now = NowSeconds();
+    // Hovered pills brighten and pick up a hint of the module's own colour.
+    auto pillColor = [&](Mod m, HWND h, const Color& base, const Color& hovered) {
+        return Color::Lerp(base, hovered, HoverLevel(m, h, now));
+    };
+    auto hoverTint = [&](Mod m) { return Color::Lerp(t.pillHover, ModAccent(t, m), 0.12f); };
 
     if (!r.Begin(memDC_, pxWidth, pxHeight, (float)mon.dpi)) return;
     r.Clear(t.background);
@@ -411,7 +536,7 @@ void Bar::Render() {
     };
     auto drawModule = [&](const Item& it, float x) {
         D2D1_RECT_F rc{ x, top, x + it.w, bottom };
-        r.FillRound(rc, radius, isHover(it.mod, nullptr) ? t.pillHover : t.pill);
+        r.FillRound(rc, radius, pillColor(it.mod, nullptr, t.pill, hoverTint(it.mod)));
         DrawSpans(r, t, it.spans, x + kPad, top, bottom);
         newHits.push_back({ rc, it.mod, nullptr });
     };
@@ -439,6 +564,7 @@ void Bar::Render() {
         drawModule(it, cx);
         cx += it.w + kGap;
     }
+    float centerRight = cw > 0 ? cx : rightEdge;
 
     // Left group; the window list takes whatever room is left.
     std::vector<Item> left = build(cfg.modulesLeft);
@@ -486,9 +612,10 @@ void Bar::Render() {
             bool isAct = w->hwnd == active;
             float wdt = itemW + (isAct && titleW > 0 ? titleW + 6.f : 0);
             D2D1_RECT_F rc{ lx, top, lx + wdt, bottom };
-            if (isAct) r.FillRound(rc, radius, isHover(Mod::Windows, w->hwnd) ? t.pillHover : t.pillActive);
-            else if (isHover(Mod::Windows, w->hwnd)) r.FillRound(rc, radius, t.pillHover);
-            else if (w->flashing) r.FillRound(rc, radius, t.warn.WithAlpha(0.35f));
+            float lv = HoverLevel(Mod::Windows, w->hwnd, now);
+            if (isAct) r.FillRound(rc, radius, Color::Lerp(t.pillActive, Color::Lerp(t.pillActive, t.text, 0.10f), lv));
+            else if (w->flashing) r.FillRound(rc, radius, Color::Lerp(Color::Lerp(t.background, t.warn, 0.35f), t.pillHover, lv));
+            else if (lv > 0.001f) r.FillRound(rc, radius, Color::Lerp(t.background, t.pillHover, lv));
             float cy = (top + bottom) / 2;
             D2D1_RECT_F ir{ lx + ipad, cy - iconSz / 2, lx + ipad + iconSz, cy + iconSz / 2 };
             if (w->icon) {
@@ -512,7 +639,7 @@ void Bar::Render() {
         }
         if (shown < wins.size()) {
             D2D1_RECT_F rc{ lx, top, lx + overflowW, bottom };
-            r.FillRound(rc, radius, isHover(Mod::WindowOverflow, nullptr) ? t.pillHover : t.pill);
+            r.FillRound(rc, radius, pillColor(Mod::WindowOverflow, nullptr, t.pill, t.pillHover));
             r.Text(Fmt(L"+%zu", wins.size() - shown), Font::Text, rc, t.subtext, Align::Center);
             newHits.push_back({ rc, Mod::WindowOverflow, nullptr });
             lx += overflowW + igap;
@@ -525,6 +652,20 @@ void Bar::Render() {
     hover = -1;
     for (size_t i = 0; i < hits.size(); ++i)
         if (hits[i].mod == hoverMod && hits[i].hwnd == hoverHwnd && hoverMod != Mod::None) hover = (int)i;
+
+    // The empty stretches the pet may walk along: apps .. clock, and clock .. stats.
+    if (cw > 0) {
+        gapL_[0] = lx; gapR_[0] = centerLeft - kGap;
+        gapL_[1] = centerRight; gapR_[1] = rightEdge;
+    } else {
+        gapL_[0] = lx; gapR_[0] = rightEdge;
+        gapL_[1] = gapR_[1] = 0;
+    }
+
+    // The whole surface was just redrawn: put the pet back on top before it reaches the screen.
+    GdiFlush();
+    petDrawn_ = false;
+    if (app_.PetBar() == this && app_.pet.shown) PetDraw();
 
     if (visible) {
         HDC dc = GetDC(hwnd);
@@ -576,15 +717,18 @@ LRESULT Bar::Proc(UINT m, WPARAM w, LPARAM l) {
         }
         int idx = HitTest(GET_X_LPARAM(l), GET_Y_LPARAM(l));
         if (idx != hover) {
-            hover = idx;
+            SetHover(idx);
             app_.UpdateCpuCounterDemand();
             Render();
-            if (app_.tip.Visible()) {
-                if (idx >= 0) app_.tip.Show(this, hits[idx]);
-                else app_.tip.Hide(__LINE__);
+            bool tipHere = app_.tip.Visible() && app_.tip.Owner() == this;
+            if (tipHere) {
+                // Crossing the small gap between two pills shouldn't close the card: wait a moment
+                // and let it glide to the next module instead.
+                if (idx >= 0) { KillTimer(hwnd, T_TIPHIDE); app_.tip.Show(this, hits[idx]); }
+                else SetTimer(hwnd, T_TIPHIDE, 160, nullptr);
             } else {
                 KillTimer(hwnd, T_TIP);
-                if (idx >= 0) SetTimer(hwnd, T_TIP, 450, nullptr);
+                if (idx >= 0) SetTimer(hwnd, T_TIP, 400, nullptr);
             }
         }
         return 0;
@@ -592,14 +736,26 @@ LRESULT Bar::Proc(UINT m, WPARAM w, LPARAM l) {
     case WM_MOUSELEAVE:
         tracking_ = false;
         KillTimer(hwnd, T_TIP);
-        HideTip(__LINE__);
-        if (hover != -1) { hover = -1; Render(); }
+        KillTimer(hwnd, T_TIPHIDE);
+        if (app_.tip.Owner() == this) app_.tip.FadeOut();
+        if (hover != -1) { SetHover(-1); Render(); }
         app_.UpdateCpuCounterDemand();
         return 0;
     case WM_TIMER:
         if (w == T_TIP) {
             KillTimer(hwnd, T_TIP);
             if (hover >= 0 && hover < (int)hits.size()) app_.tip.Show(this, hits[hover]);
+        } else if (w == T_TIPHIDE) {
+            KillTimer(hwnd, T_TIPHIDE);
+            if (hover < 0 && app_.tip.Owner() == this) app_.tip.FadeOut();
+        } else if (w == T_ANIM) {
+            Render();
+            double now = NowSeconds();
+            if (!FadesBusy(now)) {
+                KillTimer(hwnd, T_ANIM);
+                animating_ = false;
+                fades_.erase(std::remove_if(fades_.begin(), fades_.end(), [](const Fade& f) { return f.to == 0.f; }), fades_.end());
+            }
         }
         return 0;
     case WM_LBUTTONUP:
@@ -607,6 +763,10 @@ LRESULT Bar::Proc(UINT m, WPARAM w, LPARAM l) {
     case WM_MBUTTONUP: {
         POINT pt{ GET_X_LPARAM(l), GET_Y_LPARAM(l) };
         int idx = HitTest(pt.x, pt.y);
+        if (idx < 0 && m == WM_LBUTTONUP && PetHitTest(pt.x, pt.y)) {
+            app_.PetHop();  // poke the pet
+            return 0;
+        }
         ClientToScreen(hwnd, &pt);
         // Menus open just below the bar.
         pt.y = barRect.bottom;
@@ -645,223 +805,4 @@ LRESULT Bar::Proc(UINT m, WPARAM w, LPARAM l) {
         return 0;
     }
     return DefWindowProcW(hwnd, m, w, l);
-}
-
-// --- Tooltip ---------------------------------------------------------------------------------
-
-bool Tooltip::Create(HINSTANCE inst) {
-    WNDCLASSEXW wc{ sizeof(wc) };
-    wc.hInstance = inst;
-    wc.lpfnWndProc = Proc;
-    wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    wc.lpszClassName = L"TopBarTip";
-    wc.style = CS_DROPSHADOW;
-    RegisterClassExW(&wc);
-    hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT, L"TopBarTip", L"",
-                           WS_POPUP, 0, 0, 10, 10, nullptr, nullptr, inst, this);
-    if (!hwnd) return false;
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)this);
-    DWM_WINDOW_CORNER_PREFERENCE pref = DWMWCP_ROUND;
-    DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref, sizeof(pref));
-    BOOL yes = TRUE;
-    DwmSetWindowAttribute(hwnd, DWMWA_TRANSITIONS_FORCEDISABLED, &yes, sizeof(yes));
-    return true;
-}
-
-void Tooltip::Show(Bar* bar, const Hit& hit) {
-    if (!hwnd || !bar) return;
-    owner_ = bar;
-    hit_ = hit;
-    visible_ = true;
-    if (hit.mod == Mod::Cpu) App::I->stats.SampleCpuCountersIfStale();
-    Draw();
-}
-
-void Tooltip::Refresh() {
-    if (visible_ && owner_) Draw();
-}
-
-void Tooltip::Hide(int line) {
-    if (!hwnd) return;
-    if (visible_) { ShowWindow(hwnd, SW_HIDE); DebugLog(L"tip hide line %d", line); }
-    visible_ = false;
-    owner_ = nullptr;
-}
-
-void Tooltip::Draw() {
-    App& a = *App::I;
-    std::wstring title;
-    std::vector<TipLine> lines;
-    TipExtra extra;
-    a.BuildTooltip(hit_, title, lines, extra);
-    if (title.empty() && lines.empty()) { Hide(-1); return; }
-    Renderer& r = a.renderer;
-    const Theme& t = a.cfg.theme;
-    const Stats& st = a.stats;
-    Bar& bar = *owner_;
-    float s = bar.Scale();
-
-    // The last line is a usage hint when it has no label; it goes at the very bottom.
-    std::wstring hint;
-    if (!lines.empty() && lines.back().label.empty()) { hint = lines.back().value; lines.pop_back(); }
-
-    const float pad = 12.f, colGap = 18.f, maxW = 620.f;
-    if (title.size() > 90) title = title.substr(0, 87) + L"...";
-    float titleH = r.LineHeight(Font::TipBold);
-    float lineH = r.LineHeight(Font::Tip) + 3.f;
-    float labelW = 0, valueW = 0;
-    for (auto& ln : lines) {
-        labelW = std::max(labelW, r.Measure(ln.label, Font::Tip));
-        valueW = std::max(valueW, r.Measure(ln.value, Font::Tip));
-    }
-    float contentW = std::max({ r.Measure(title, Font::TipBold), labelW + colGap + valueW, r.Measure(hint, Font::Sub) });
-
-    // Per-core grid: one row per physical core, one bar per hardware thread.
-    std::vector<std::vector<int>> coreRows;
-    float gridW = 0, rowW = 0, gridLabelW = 0, barW = 64.f, pctW = 0;
-    int gridCols = 1, rowsPerCol = 0;
-    const float rowH = 17.f, gridColGap = 22.f;
-    if (extra.coreGrid) {
-        int n = (int)st.cores.size();
-        bool mapped = st.physicalCores > 0 && (int)st.threadCore.size() >= n;
-        for (int i = 0; i < n && mapped; ++i) if (st.threadCore[i] < 0) mapped = false;
-        if (mapped) {
-            coreRows.assign(st.physicalCores, {});
-            for (int i = 0; i < n; ++i)
-                if (st.threadCore[i] < st.physicalCores) coreRows[st.threadCore[i]].push_back(i);
-            coreRows.erase(std::remove_if(coreRows.begin(), coreRows.end(), [](auto& v) { return v.empty(); }), coreRows.end());
-        } else {
-            for (int i = 0; i < n; ++i) coreRows.push_back({ i });
-        }
-        size_t maxThreads = 1;
-        for (auto& row : coreRows) maxThreads = std::max(maxThreads, row.size());
-        if (maxThreads == 1) barW = 110.f;
-        gridLabelW = r.Measure(mapped ? L"Core 00" : L"CPU 00", Font::Tip);
-        pctW = r.Measure(L"100%", Font::Tip);
-        rowW = gridLabelW + 10.f + maxThreads * (barW + 6.f + pctW) + (maxThreads - 1) * 12.f;
-        gridCols = coreRows.size() > 8 ? 2 : 1;
-        rowsPerCol = (int)((coreRows.size() + gridCols - 1) / gridCols);
-        gridW = gridCols * rowW + (gridCols - 1) * gridColGap;
-        contentW = std::max(contentW, gridW);
-    }
-    if (extra.cpuHistory) contentW = std::max(contentW, 300.f);
-    contentW = std::min(contentW, maxW);
-
-    const float sectionH = 18.f, chartH = 46.f;
-    float h = pad + titleH;
-    if (!lines.empty()) h += 8.f + lines.size() * lineH;
-    if (extra.cpuHistory) h += 8.f + sectionH + chartH;
-    if (!coreRows.empty()) h += 8.f + sectionH + rowsPerCol * rowH;
-    if (!hint.empty()) h += 6.f + lineH;
-    h += pad - 2.f;
-    float w = contentW + pad * 2;
-
-    int pw = (int)std::ceil(w * s), ph = (int)std::ceil(h * s);
-    if (!memDC_) {
-        HDC screen = GetDC(nullptr);
-        memDC_ = CreateCompatibleDC(screen);
-        ReleaseDC(nullptr, screen);
-    }
-    if (!dib_ || dibW_ != pw || dibH_ != ph) {
-        if (oldBmp_) SelectObject(memDC_, oldBmp_);
-        if (dib_) DeleteObject(dib_);
-        BITMAPINFO bi{};
-        bi.bmiHeader = { sizeof(BITMAPINFOHEADER), pw, -ph, 1, 32, BI_RGB };
-        void* bits = nullptr;
-        dib_ = CreateDIBSection(memDC_, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
-        oldBmp_ = SelectObject(memDC_, dib_);
-        dibW_ = pw;
-        dibH_ = ph;
-    }
-
-    if (!r.Begin(memDC_, pw, ph, (float)bar.mon.dpi)) return;
-    r.Clear(t.pill);
-    r.StrokeRound({ 0.5f / s, 0.5f / s, w - 0.5f / s, h - 0.5f / s }, 7.f, t.pillActive, 1.f / s);
-    float y = pad - 2.f;
-    r.Text(title, Font::TipBold, { pad, y, pad + contentW, y + titleH }, t.text, Align::Left, true);
-    y += titleH + 4.f;
-    auto separator = [&] { r.FillRect({ pad, y, w - pad, y + 1.f / s }, t.pillActive); y += 4.f; };
-    if (!lines.empty()) {
-        separator();
-        for (auto& ln : lines) {
-            r.Text(ln.label, Font::Tip, { pad, y, pad + labelW, y + lineH }, t.subtext, Align::Left, true);
-            r.Text(ln.value, Font::Tip, { pad + labelW + colGap, y, pad + contentW, y + lineH }, t.text, Align::Left, true);
-            y += lineH;
-        }
-    }
-    if (extra.cpuHistory) {
-        y += 4.f;
-        r.Text(L"Last minute", Font::Sub, { pad, y, pad + contentW, y + sectionH }, t.subtext);
-        y += sectionH;
-        D2D1_RECT_F chart{ pad, y, pad + contentW, y + chartH };
-        r.FillRound(chart, 4.f, t.background);
-        r.FillRect({ chart.left, (chart.top + chart.bottom) / 2, chart.right, (chart.top + chart.bottom) / 2 + 1.f / s }, t.pillHover);
-        D2D1_RECT_F inner{ chart.left + 1.f, chart.top + 3.f, chart.right - 1.f, chart.bottom - 1.f };
-        r.AreaChart(inner, st.cpuHistory, 60, t.cpu, t.cpu.WithAlpha(0.22f));
-        y += chartH;
-    }
-    if (!coreRows.empty()) {
-        y += 4.f;
-        r.Text(st.physicalCores > 0 && coreRows.size() == (size_t)st.physicalCores ? L"Per core  (each bar is one thread)" : L"Per CPU",
-               Font::Sub, { pad, y, pad + contentW, y + sectionH }, t.subtext);
-        y += sectionH;
-        bool mapped = coreRows.size() == (size_t)st.physicalCores && st.physicalCores > 0;
-        for (size_t ri = 0; ri < coreRows.size(); ++ri) {
-            int col = (int)(ri / rowsPerCol), row = (int)(ri % rowsPerCol);
-            float x = pad + col * (rowW + gridColGap), ry = y + row * rowH;
-            r.Text(Fmt(mapped ? L"Core %zu" : L"CPU %d", mapped ? ri + 1 : (size_t)coreRows[ri][0]), Font::Tip,
-                   { x, ry, x + gridLabelW, ry + rowH }, t.subtext);
-            x += gridLabelW + 10.f;
-            for (int lp : coreRows[ri]) {
-                float v = lp < (int)st.cores.size() ? st.cores[lp] : 0.f;
-                float cy = ry + rowH / 2;
-                D2D1_RECT_F bg{ x, cy - 3.5f, x + barW, cy + 3.5f };
-                r.FillRound(bg, 2.f, t.pillActive);
-                if (v > 0.005f) {
-                    Color c = v < 0.6f ? t.cpu : (v < 0.85f ? t.warn : t.hot);
-                    r.FillRound({ bg.left, bg.top, bg.left + std::max(3.f, barW * v), bg.bottom }, 2.f, c);
-                }
-                r.Text(Fmt(L"%.0f%%", v * 100.f), Font::Tip, { x + barW + 6.f, ry, x + barW + 6.f + pctW, ry + rowH },
-                       v >= 0.85f ? t.hot : t.text, Align::Right);
-                x += barW + 6.f + pctW + 12.f;
-            }
-        }
-        y += rowsPerCol * rowH;
-    }
-    if (!hint.empty()) {
-        y += 6.f;
-        r.Text(hint, Font::Sub, { pad, y, pad + contentW, y + lineH }, t.subtext, Align::Left, true);
-    }
-    r.End();
-
-    // Position under the hovered module, kept on the bar's monitor.
-    int cx = bar.barRect.left + (int)(((hit_.rect.left + hit_.rect.right) / 2) * s);
-    int x = cx - pw / 2;
-    int yPos = bar.barRect.bottom + (int)(6 * s);
-    x = std::clamp(x, (int)bar.mon.rect.left + (int)(6 * s), (int)bar.mon.rect.right - pw - (int)(6 * s));
-    SetWindowPos(hwnd, HWND_TOPMOST, x, yPos, pw, ph, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    HDC dc = GetDC(hwnd);
-    BitBlt(dc, 0, 0, pw, ph, memDC_, 0, 0, SRCCOPY);
-    ReleaseDC(hwnd, dc);
-}
-
-LRESULT CALLBACK Tooltip::Proc(HWND h, UINT m, WPARAM w, LPARAM l) {
-    auto* self = (Tooltip*)GetWindowLongPtrW(h, GWLP_USERDATA);
-    switch (m) {
-    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-    case WM_NCHITTEST: return HTTRANSPARENT;
-    case WM_ERASEBKGND: return 1;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(h, &ps);
-        if (self && self->memDC_) {
-            RECT rc;
-            GetClientRect(h, &rc);
-            BitBlt(dc, 0, 0, rc.right, rc.bottom, self->memDC_, 0, 0, SRCCOPY);
-        }
-        EndPaint(h, &ps);
-        return 0;
-    }
-    }
-    return DefWindowProcW(h, m, w, l);
 }

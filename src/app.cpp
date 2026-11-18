@@ -4,7 +4,9 @@
 #include <iphlpapi.h>
 #include "app.h"
 #include "power.h"
+#include "wallpaper.h"
 #include <shellscalingapi.h>
+#include <shobjidl.h>
 #include <wtsapi32.h>
 #include <powrprof.h>
 #include <psapi.h>
@@ -14,8 +16,15 @@ App* App::I = nullptr;
 
 namespace {
 enum : UINT_PTR {
-    T_TICK = 1, T_SLOW, T_WATCH, T_WINLIST, T_DISPLAY, T_SHELLWAIT, T_PEEKEND, T_TRIM, T_NET, T_BTPRESENCE, T_RENDER, T_DISPLAYOFF
+    T_TICK = 1, T_SLOW, T_WATCH, T_WINLIST, T_DISPLAY, T_SHELLWAIT, T_PEEKEND, T_TRIM, T_NET, T_BTPRESENCE, T_RENDER, T_DISPLAYOFF,
+    T_PET, T_THEME, T_WALLCHECK
 };
+
+constexpr float kThemeFadeSeconds = 0.6f;
+
+// Results handed back from the background decoders.
+struct PetLoad { bool ok = false; PetSprite sprite; std::wstring error; };
+struct WallpaperResult { bool ok = false; Theme theme; };
 
 const wchar_t* kControllerClass = L"TopBarController";
 const wchar_t* kBarClass = L"TopBarWnd";
@@ -86,6 +95,8 @@ bool ParseHotkey(const std::wstring& text, UINT& mods, UINT& vk) {
     return vk != 0;
 }
 
+}  // namespace
+
 int IsoWeek(const SYSTEMTIME& st, int* dayOfYear) {
     static const int cum[] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
     int y = st.wYear;
@@ -100,6 +111,8 @@ int IsoWeek(const SYSTEMTIME& st, int* dayOfYear) {
     if (w > weeks(y)) return 1;
     return w;
 }
+
+namespace {
 
 void CALLBACK NetChangeCallback(PVOID ctx, PMIB_IPINTERFACE_ROW, MIB_NOTIFICATION_TYPE) {
     PostMessageW((HWND)ctx, WM_APP_NETCHANGE, 0, 0);
@@ -136,6 +149,22 @@ Mod ModFromName(const std::wstring& n) {
     return Mod::None;
 }
 
+Color ModAccent(const Theme& t, Mod m) {
+    switch (m) {
+    case Mod::Cpu: return t.cpu;
+    case Mod::Gpu: return t.gpu;
+    case Mod::Memory: return t.memory;
+    case Mod::Disk: return t.disk;
+    case Mod::NetSpeed:
+    case Mod::Network: return t.network;
+    case Mod::Volume: return t.volume;
+    case Mod::Bluetooth: return t.bluetooth;
+    case Mod::Battery: return t.battery;
+    case Mod::Power: return t.power;
+    default: return t.accent;
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 
 int App::Run(HINSTANCE instance, int command) {
@@ -145,6 +174,8 @@ int App::Run(HINSTANCE instance, int command) {
 
     if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE))) return 1;
     cfg.Load();
+    ApplyThemeOverride();
+    animationsOn_ = SystemAnimationsEnabled();
 
     if (cfg.efficiencyMode) {
         PROCESS_POWER_THROTTLING_STATE st{};
@@ -234,14 +265,17 @@ void App::Start() {
     windowsDirty_ = false;
     Watch();
     ApplyVisibility();
+    ApplyPet();
+    CheckWallpaper(true);
     SetTimer(hwnd, T_TRIM, 8000, nullptr);
 }
 
 void App::Stop() {
+    KillTimer(hwnd, T_PET);
+    pet.sprite.reset();
     for (auto& b : bars) b->UnregisterAppBar();
     bars.clear();
-    if (tip.hwnd) DestroyWindow(tip.hwnd);
-    tip.hwnd = nullptr;
+    tip.Destroy();
 }
 
 void App::UpdateMetrics() {
@@ -260,8 +294,14 @@ void App::RegisterHotkey() {
 }
 
 void App::ReloadConfig() {
+    Theme before = cfg.theme;  // what is on screen now
     cfg.Load();
+    ApplyThemeOverride();
+    Theme after = cfg.theme;
+    bool themeChanged = memcmp(&before, &after, sizeof(Theme)) != 0;
+    if (themeChanged && started_) cfg.theme = before;  // and fade over to the new colours below
     ApplyConfig();
+    if (themeChanged && started_) StartThemeFade(after);
 }
 
 void App::ApplyConfig() {
@@ -274,6 +314,10 @@ void App::ApplyConfig() {
     for (auto& b : bars) b->Reposition();
     ApplyVisibility();
     RenderAll();
+    if (started_) {
+        ApplyPet();
+        CheckWallpaper(false);
+    }
 }
 
 struct MonEnumCtx { std::vector<MonitorDesc> list; };
@@ -355,6 +399,7 @@ void App::ApplyVisibility() {
     SetSampling(any);
     for (size_t i = 0; i < bars.size(); ++i) bars[i]->SetVisible(want[i]);
     if (!any) tip.Hide(__LINE__);
+    UpdatePetTimer();
 }
 
 void App::SetSampling(bool on) {
@@ -416,6 +461,8 @@ void App::SlowTick() {
     }
     if (slowCount_ % 15 == 1) stats.SampleDisks();
     if (slowCount_ % 15 == 0) stats.SampleBattery();
+    // A slideshow may change the picture without telling anyone; a file-time check is enough.
+    if (cfg.fromWallpaper && slowCount_ % 15 == 7) CheckWallpaper(false);
     RequestWindowRefresh();  // safety net for anything the shell hook missed
 }
 
@@ -651,6 +698,26 @@ LRESULT App::Proc(UINT m, WPARAM w, LPARAM l) {
             stats.RefreshGpuOutputs();
             RebuildBars();
             Watch();
+            ApplyPet();  // the pet's monitor or its scaling may have changed
+            break;
+        case T_PET:
+            PetTick();
+            break;
+        case T_THEME: {
+            float t = fadeStart_ < 0 ? 1.f : (float)((NowSeconds() - fadeStart_) / kThemeFadeSeconds);
+            cfg.theme = t >= 1.f ? fadeTo_ : LerpTheme(fadeFrom_, fadeTo_, EaseOut(t));
+            RenderAll();
+            tip.Refresh();
+            if (t >= 1.f) {
+                KillTimer(hwnd, T_THEME);
+                fadeStart_ = -1;
+                ApplyPet();  // the built-in pet wears the accent colour
+            }
+            break;
+        }
+        case T_WALLCHECK:
+            KillTimer(hwnd, T_WALLCHECK);
+            CheckWallpaper(true);
             break;
         case T_SHELLWAIT:
             if (FindWindowW(L"Shell_TrayWnd", nullptr)) Start();
@@ -722,14 +789,56 @@ LRESULT App::Proc(UINT m, WPARAM w, LPARAM l) {
         case RemoteCommand::Exit: DestroyWindow(hwnd); break;
         case RemoteCommand::Toggle: userHidden_ = !userHidden_; ApplyVisibility(); break;
         case RemoteCommand::Reload: ReloadConfig(); break;
+#ifdef TOPBAR_DRY_RUN
+        case RemoteCommand::Snapshot: {
+            wchar_t dir[MAX_PATH];
+            GetTempPathW(MAX_PATH, dir);
+            if (!bars.empty()) tip.Snapshot(PetBar(), std::wstring(dir) + L"topbar-snap");
+            break;
+        }
+#endif
+        default: break;
         }
         return 0;
+
+    case WM_APP_PET: {
+        std::unique_ptr<PetLoad> res((PetLoad*)l);
+        if ((unsigned)w != petGen_ || !cfg.petEnabled) return 0;
+        if (res->ok) {
+            pet.sprite = std::make_shared<PetSprite>(std::move(res->sprite));
+            pet.frame = 0;
+            DebugLog(L"pet: %dx%d, %zu frames", pet.sprite->w, pet.sprite->h, pet.sprite->frames.size());
+        } else {
+            DebugLog(L"pet: %s", res->error.c_str());
+            if (petInteractive_)
+                MessageBoxW(nullptr, (L"That picture can't be used as the pet.\n\n" + res->error).c_str(), TOPBAR_NAME,
+                            MB_ICONWARNING | MB_OK);
+            // Show the built-in pet instead, so the setting visibly does something.
+            auto sp = std::make_shared<PetSprite>();
+            MakeBlobSprite(renderer, petPx_, cfg.theme, *sp);
+            if (!PowerOverlay::IsOpen()) renderer.ReleaseAlphaTarget();
+            pet.sprite = sp;
+        }
+        petInteractive_ = false;
+        UpdatePetTimer();
+        return 0;
+    }
+    case WM_APP_WALLPAPER: {
+        std::unique_ptr<WallpaperResult> res((WallpaperResult*)l);
+        if ((unsigned)w != wallGen_ || !cfg.fromWallpaper || !res->ok) return 0;
+        wallTheme_ = res->theme;
+        wallThemeValid_ = true;
+        StartThemeFade(wallTheme_);
+        return 0;
+    }
 
     case WM_DISPLAYCHANGE:
         SetTimer(hwnd, T_DISPLAY, 500, nullptr);
         return 0;
     case WM_SETTINGCHANGE:
         if (l && wcscmp((const wchar_t*)l, L"intl") == 0) RenderAll();
+        if (w == SPI_SETDESKWALLPAPER && cfg.fromWallpaper) SetTimer(hwnd, T_WALLCHECK, 600, nullptr);
+        if (w == SPI_SETCLIENTAREAANIMATION) animationsOn_ = SystemAnimationsEnabled();
         break;
     case WM_DEVICECHANGE:
         if (w == DBT_DEVNODES_CHANGED) SetTimer(hwnd, T_BTPRESENCE, 1500, nullptr);
@@ -760,10 +869,12 @@ LRESULT App::Proc(UINT m, WPARAM w, LPARAM l) {
             } else {
                 stats.SampleBattery();
                 if (sampling_) { RenderAll(); ScheduleTick(CurrentInterval()); }
+                UpdatePetTimer();  // pause_on_battery
             }
         } else if (w == PBT_APMPOWERSTATUSCHANGE) {
             stats.SampleBattery();
             if (sampling_) RenderAll();
+            UpdatePetTimer();
         } else if (w == PBT_APMRESUMEAUTOMATIC || w == PBT_APMRESUMESUSPEND) {
             stats.ResetBaselines();
             SetTimer(hwnd, T_DISPLAY, 1000, nullptr);
@@ -800,155 +911,300 @@ void App::TurnDisplayOffSoon() {
     SetTimer(hwnd, T_DISPLAYOFF, 700, nullptr);
 }
 
-void App::BuildTooltip(const Hit& hit, std::wstring& title, std::vector<TipLine>& lines, TipExtra& extra) {
+namespace {
+
+// "1.2 GB" -> "1.2" + "GB"
+void SplitUnit(const std::wstring& s, std::wstring& value, std::wstring& unit) {
+    size_t sp = s.rfind(L' ');
+    if (sp == std::wstring::npos) { value = s; unit.clear(); return; }
+    value = s.substr(0, sp);
+    unit = s.substr(sp + 1);
+}
+
+TipStat StatOf(const std::wstring& formatted, const std::wstring& label) {
+    TipStat st;
+    SplitUnit(formatted, st.value, st.unit);
+    st.label = label;
+    return st;
+}
+
+TipStat Stat(const std::wstring& value, const std::wstring& unit, const std::wstring& label, Color color = Color{ 0, 0, 0, 0 }) {
+    TipStat st;
+    st.value = value;
+    st.unit = unit;
+    st.label = label;
+    st.color = color;
+    return st;
+}
+
+const Color kNone{ 0, 0, 0, 0 };
+
+std::wstring Pct(float v) { return Fmt(L"%.0f", v * 100.f); }
+
+float Average(const std::vector<float>& v) {
+    if (v.empty()) return 0;
+    float s = 0;
+    for (float x : v) s += x;
+    return s / v.size();
+}
+
+float Peak(const std::vector<float>& v) {
+    float m = 0;
+    for (float x : v) m = std::max(m, x);
+    return m;
+}
+
+// A round chart ceiling for byte rates (1, 2 or 5 x a power of ten), at least 8 KB/s so idle
+// chatter isn't blown up to look like traffic.
+float NiceRateMax(float peak) {
+    float v = std::max(peak * 1.15f, 8.f * 1024.f);
+    float p = std::pow(10.f, std::floor(std::log10(v)));
+    for (float m : { 1.f, 2.f, 5.f, 10.f })
+        if (v <= m * p) return m * p;
+    return v;
+}
+
+bool Use24h(const Config& cfg) {
+    if (cfg.clock24h == L"1") return true;
+    if (cfg.clock24h == L"0") return false;
+    wchar_t f[80] = L"";
+    GetLocaleInfoEx(LOCALE_NAME_USER_DEFAULT, LOCALE_STIMEFORMAT, f, _countof(f));
+    return wcschr(f, L'H') != nullptr;
+}
+
+}  // namespace
+
+void App::BuildTooltip(const Hit& hit, TipContent& c) {
     const Stats& s = stats;
-    auto pct = [](float v) { return Fmt(L"%.0f%%", v * 100.f); };
+    const Theme& t = cfg.theme;
+    c.accent = ModAccent(t, hit.mod);
     switch (hit.mod) {
     case Mod::Windows: {
         WinItem* w = windows.Find(hit.hwnd);
         if (!w) break;
-        title = w->title;
-        lines.push_back({ L"App", w->exe });
-        lines.push_back({ L"State", w->minimized ? L"Minimized" : (hit.hwnd == windows.Active() ? L"Active" : L"Open") });
-        lines.push_back({ L"", L"Click switch · Middle-click close · Right-click menu" });
+        bool active = hit.hwnd == windows.Active();
+        c.glyph = glyph::Window;
+        c.icon = w->icon.Get();
+        c.title = w->title.empty() ? w->exe : w->title;
+        c.subtitle = w->exe;
+        if (w->minimized) { c.badge = L"Minimized"; c.badgeColor = t.subtext; }
+        else if (active) { c.badge = L"Active"; c.badgeColor = t.accent; }
+        c.hints = { { L"Click", active ? L"Minimize" : L"Switch" }, { L"Middle-click", L"Close" }, { L"Right-click", L"Window menu" } };
         break;
     }
     case Mod::WindowOverflow:
-        title = L"More windows";
-        lines.push_back({ L"", L"Click to pick a window" });
+        c.glyph = glyph::More;
+        c.title = L"More windows";
+        c.subtitle = L"The ones that don't fit on the bar";
+        c.hints = { { L"Click", L"Pick one" } };
         break;
     case Mod::Clock: {
         SYSTEMTIME st;
         GetLocalTime(&st);
         wchar_t buf[128];
         GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_LONGDATE, &st, nullptr, buf, _countof(buf), nullptr);
-        title = buf;
-        GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, nullptr, buf, _countof(buf));
-        lines.push_back({ L"Time", buf });
+        c.glyph = glyph::Calendar;
+        c.title = buf;
         int doy = 0;
         int week = IsoWeek(st, &doy);
-        lines.push_back({ L"Week", Fmt(L"%d", week) });
-        lines.push_back({ L"Day of year", Fmt(L"%d", doy) });
-        lines.push_back({ L"Uptime", FormatDuration(GetTickCount64() / 1000) });
-        lines.push_back({ L"", L"Click for calendar & notifications" });
+        bool leap = (st.wYear % 4 == 0 && st.wYear % 100 != 0) || st.wYear % 400 == 0;
+        c.subtitle = Fmt(L"Week %d · day %d of %d", week, doy, leap ? 366 : 365);
+        bool h24 = Use24h(cfg);
+        GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, h24 ? L"HH':'mm" : L"h':'mm", buf, _countof(buf));
+        std::wstring unit = Fmt(L":%02d", st.wSecond);
+        if (!h24) {
+            wchar_t ampm[16] = L"";
+            GetTimeFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &st, L"tt", ampm, _countof(ampm));
+            if (ampm[0]) unit += std::wstring(L" ") + ampm;
+        }
+        c.stats.push_back(Stat(buf, unit, L"Local time"));
+        c.stats.push_back(Stat(FormatDuration(GetTickCount64() / 1000), L"", L"Uptime"));
+        c.calendar = true;
+        c.hints = { { L"Click", L"Calendar & notifications" }, { L"Right-click", L"Date & time" } };
         break;
     }
-    case Mod::NetSpeed:
-        title = L"Network traffic";
-        lines.push_back({ L"Download", FormatRate(s.rxRate, cfg.netBits) });
-        lines.push_back({ L"Upload", FormatRate(s.txRate, cfg.netBits) });
-        lines.push_back({ L"Received since boot", FormatBytes(s.rxTotal) });
-        lines.push_back({ L"Sent since boot", FormatBytes(s.txTotal) });
+    case Mod::NetSpeed: {
+        c.glyph = glyph::Down;
+        c.title = L"Network traffic";
+        c.subtitle = L"All network adapters";
+        Color up = t.memory;
+        TipStat down = StatOf(FormatRate(s.rxRate, cfg.netBits), L"Download");
+        down.dot = t.network;
+        TipStat upl = StatOf(FormatRate(s.txRate, cfg.netBits), L"Upload");
+        upl.dot = up;
+        c.stats = { down, upl };
+        float peakRx = Peak(s.rxHistory), peakTx = Peak(s.txHistory);
+        c.hasChart = s.rxHistory.size() >= 2;
+        c.chart = { &s.rxHistory, &s.txHistory, t.network, up, NiceRateMax(std::max(peakRx, peakTx)), L"Last minute",
+                    L"peak ↓ " + FormatRate(peakRx, cfg.netBits) + L"   ↑ " + FormatRate(peakTx, cfg.netBits) };
+        c.rows.push_back({ L"Received since boot", FormatBytes(s.rxTotal) });
+        c.rows.push_back({ L"Sent since boot", FormatBytes(s.txTotal) });
+        c.hints = { { L"Click", L"Networks" }, { L"Right-click", L"Network settings" } };
         break;
+    }
     case Mod::Network: {
         const NetInfo& n = s.net;
-        title = n.kind == NetInfo::Wifi ? L"Wi-Fi" : n.kind == NetInfo::Ethernet ? L"Ethernet"
-              : n.kind == NetInfo::Other ? n.adapterName : L"Not connected";
-        if (n.kind != NetInfo::None) {
-            if (!n.description.empty()) lines.push_back({ L"Adapter", n.description });
-            if (!n.ipv4.empty()) lines.push_back({ L"IPv4", n.ipv4 });
-            if (n.linkSpeed) {
-                double mbps = n.linkSpeed / 1e6;
-                lines.push_back({ L"Link speed", mbps >= 1000 ? Fmt(L"%.1f Gbps", mbps / 1000) : Fmt(L"%.0f Mbps", mbps) });
-            }
-            lines.push_back({ L"Internet", n.internet ? L"Connected" : L"No internet access" });
+        switch (n.kind) {
+        case NetInfo::Wifi:
+            c.glyph = glyph::Wifi[n.signal < 0 ? 3 : std::clamp(n.signal / 25, 0, 3)];
+            c.title = n.ssid.empty() ? L"Wi-Fi" : n.ssid;
+            break;
+        case NetInfo::Ethernet: c.glyph = glyph::Eth; c.title = L"Ethernet"; break;
+        case NetInfo::Other: c.glyph = glyph::Vpn; c.title = n.adapterName; break;
+        default: c.glyph = glyph::Offline; c.title = L"Not connected"; c.accent = t.hot; break;
         }
-        if (n.wifiPresent) {
-            std::wstring wifi = !n.wifiRadioOn ? L"Off" : n.wifiConnected
-                ? (n.ssid.empty() ? L"Connected" : n.ssid) + (n.signal >= 0 ? Fmt(L"  (%d%%)", n.signal) : L"")
-                : L"On, not connected";
-            lines.push_back({ L"Wi-Fi", wifi });
+        c.subtitle = n.kind == NetInfo::None ? L"No network adapter is connected" : n.description;
+        if (n.kind == NetInfo::None) { c.badge = L"Offline"; c.badgeColor = t.hot; }
+        else if (n.internet) { c.badge = L"Online"; c.badgeColor = t.battery; }
+        else { c.badge = L"No internet"; c.badgeColor = t.warn; }
+        if (n.kind == NetInfo::Wifi && n.signal >= 0) c.stats.push_back(Stat(Fmt(L"%d", n.signal), L"%", L"Signal"));
+        if (n.linkSpeed) {
+            double mbps = n.linkSpeed / 1e6;
+            if (mbps >= 1000) c.stats.push_back(Stat(Fmt(L"%.1f", mbps / 1000), L"Gbps", L"Link speed"));
+            else c.stats.push_back(Stat(Fmt(L"%.0f", mbps), L"Mbps", L"Link speed"));
         }
-        lines.push_back({ L"", L"Click for networks · Right-click settings" });
+        if (!n.ipv4.empty()) c.rows.push_back({ L"IPv4", n.ipv4 });
+        if (n.kind != NetInfo::None && n.kind != NetInfo::Wifi && !n.adapterName.empty()) c.rows.push_back({ L"Interface", n.adapterName });
+        if (n.wifiPresent && n.kind != NetInfo::Wifi)
+            c.rows.push_back({ L"Wi-Fi", !n.wifiRadioOn ? L"Off" : n.wifiConnected ? (n.ssid.empty() ? L"Connected" : n.ssid) : L"On, not connected" });
+        c.hints = { { L"Click", L"Networks" }, { L"Right-click", L"Network settings" } };
         break;
     }
     case Mod::Cpu: {
-        title = s.cpuName;
-        lines.push_back({ L"Usage", pct(s.cpu) + (s.useUtility ? L"  (Task Manager method)" : L"") });
+        c.glyph = glyph::Cpu;
+        c.title = s.cpuName;
+        if (s.physicalCores) c.subtitle = Fmt(L"%d cores · %d threads", s.physicalCores, s.logicalCpus);
+        if (s.cpuBaseMHz > 0) c.subtitle += Fmt(L"%s%.2f GHz base", c.subtitle.empty() ? L"" : L" · ", s.cpuBaseMHz / 1000.f);
+        c.stats.push_back(Stat(Pct(s.cpu), L"%", s.useUtility ? L"Utility" : L"Usage", s.cpu > 0.9f ? t.hot : kNone));
         if (s.utilityAvailable) {
-            if (!s.cpuCountersFresh) {
-                lines.push_back({ L"Clock speed", L"measuring\u2026" });
-            } else {
-                if (s.cpuMHz > 0)
-                    lines.push_back({ L"Clock speed", Fmt(L"%.2f GHz  (base %.2f GHz)", s.cpuMHz / 1000.f, s.cpuBaseMHz / 1000.f) });
-                if (s.useUtility) lines.push_back({ L"Busy time", pct(s.cpuBusy) });
-                else lines.push_back({ L"Task Manager", pct(s.cpuUtility) + L"  (busy time \u00D7 clock / base clock)" });
-            }
+            if (s.cpuCountersFresh && s.cpuMHz > 0) c.stats.push_back(Stat(Fmt(L"%.2f", s.cpuMHz / 1000.f), L"GHz", L"Clock"));
+            else c.stats.push_back(Stat(L"…", L"", L"Clock"));
         }
-        if (s.physicalCores) lines.push_back({ L"Cores", Fmt(L"%d cores, %d threads", s.physicalCores, s.logicalCpus) });
-        extra.cpuHistory = s.cpuHistory.size() >= 2;
-        extra.coreGrid = !s.cores.empty();
         if (!std::isnan(s.cpuTemp))
-            lines.push_back({ L"Temperature", Fmt(L"%.0f °C  (peak %.0f °C)", s.cpuTemp, s.cpuPeakTemp) });
+            c.stats.push_back(Stat(Fmt(L"%.0f", s.cpuTemp), L"°C", L"Temperature", s.cpuTemp >= 85 ? t.hot : kNone));
+        c.hasChart = s.cpuHistory.size() >= 2;
+        c.chart = { &s.cpuHistory, nullptr, t.cpu, kNone, 1.f, L"Last minute",
+                    Fmt(L"avg %.0f%%  ·  peak %.0f%%", Average(s.cpuHistory) * 100.f, Peak(s.cpuHistory) * 100.f) };
+        c.coreGrid = !s.cores.empty();
+        if (s.utilityAvailable && s.cpuCountersFresh) {
+            if (s.useUtility) c.rows.push_back({ L"Busy time", Fmt(L"%.0f%%", s.cpuBusy * 100.f) });
+            else c.rows.push_back({ L"Task Manager", Fmt(L"%.0f%%  (busy × clock ÷ base)", s.cpuUtility * 100.f) });
+        }
+        if (!std::isnan(s.cpuPeakTemp)) c.rows.push_back({ L"Hottest so far", Fmt(L"%.0f °C", s.cpuPeakTemp) });
         PERFORMANCE_INFORMATION pi{ sizeof(pi) };
         if (GetPerformanceInfo(&pi, sizeof(pi)))
-            lines.push_back({ L"Processes", Fmt(L"%lu  (%lu threads)", pi.ProcessCount, pi.ThreadCount) });
-        lines.push_back({ L"Uptime", FormatDuration(GetTickCount64() / 1000) });
-        lines.push_back({ L"", L"Click for Task Manager" });
+            c.rows.push_back({ L"Processes", Fmt(L"%lu  ·  %lu threads", pi.ProcessCount, pi.ThreadCount) });
+        c.rows.push_back({ L"Uptime", FormatDuration(GetTickCount64() / 1000) });
+        c.hints = { { L"Click", L"Task Manager" } };
         break;
     }
     case Mod::Gpu: {
         if (s.gpus.empty()) break;
         int idx = s.mainGpu >= 0 ? s.mainGpu : 0;
         const GpuStat& g = s.gpus[idx];
-        title = g.name;
-        lines.push_back({ L"Usage", pct(g.usage) });
-        if (!std::isnan(g.temp)) lines.push_back({ L"Temperature", Fmt(L"%.0f °C", g.temp) });
-        else if (g.hybridDiscrete && !g.hasOutputs && g.idleSamples >= 3) lines.push_back({ L"State", L"Idle (powered down)" });
-        if (g.dedicatedTotal)
-            lines.push_back({ L"Dedicated memory", FormatBytes(g.dedicatedUsed) + L" / " + FormatBytes(g.dedicatedTotal) });
-        lines.push_back({ L"Shared memory", FormatBytes(g.sharedUsed) });
+        c.glyph = glyph::Gpu;
+        c.title = g.name;
+        c.subtitle = g.discrete ? L"Dedicated graphics" : L"Integrated graphics";
+        if (std::isnan(g.temp) && g.hybridDiscrete && !g.hasOutputs && g.idleSamples >= 3) {
+            c.badge = L"Asleep";
+            c.badgeColor = t.subtext;
+        }
+        c.stats.push_back(Stat(Pct(g.usage), L"%", L"Usage", g.usage > 0.95f ? t.hot : kNone));
+        if (!std::isnan(g.temp)) c.stats.push_back(Stat(Fmt(L"%.0f", g.temp), L"°C", L"Temperature", g.temp >= 85 ? t.hot : kNone));
+        if (g.dedicatedTotal) c.stats.push_back(StatOf(FormatBytes(g.dedicatedUsed), L"Video memory"));
+        c.hasChart = s.gpuHistory.size() >= 2;
+        c.chart = { &s.gpuHistory, nullptr, t.gpu, kNone, 1.f, L"Last minute",
+                    Fmt(L"avg %.0f%%  ·  peak %.0f%%", Average(s.gpuHistory) * 100.f, Peak(s.gpuHistory) * 100.f) };
+        if (g.dedicatedTotal) {
+            float f = (float)((double)g.dedicatedUsed / (double)g.dedicatedTotal);
+            c.meters.push_back({ L"Dedicated memory", FormatBytes(g.dedicatedUsed) + L" of " + FormatBytes(g.dedicatedTotal), f,
+                                 FillColor(t, f, t.gpu) });
+        }
+        if (g.sharedTotal) {
+            float f = (float)((double)g.sharedUsed / (double)g.sharedTotal);
+            c.meters.push_back({ L"Shared memory", FormatBytes(g.sharedUsed) + L" of " + FormatBytes(g.sharedTotal), f, FillColor(t, f, t.gpu) });
+        }
         for (size_t i = 0; i < s.gpus.size(); ++i) {
             if ((int)i == idx) continue;
             const GpuStat& o = s.gpus[i];
-            std::wstring v = pct(o.usage);
-            if (!std::isnan(o.temp)) v += Fmt(L"  %.0f °C", o.temp);
-            lines.push_back({ o.name, v });
+            std::wstring val = Fmt(L"%.0f%%", o.usage * 100.f);
+            if (!std::isnan(o.temp)) val += Fmt(L"  ·  %.0f °C", o.temp);
+            c.rows.push_back({ o.name, val });
         }
-        lines.push_back({ L"", L"Click for Task Manager" });
+        c.hints = { { L"Click", L"Task Manager" } };
         break;
     }
-    case Mod::Memory:
-        title = L"Memory";
-        lines.push_back({ L"In use", FormatBytes(s.memUsed) + L" / " + FormatBytes(s.memTotal) + L"  (" + pct(s.memLoad) + L")" });
-        lines.push_back({ L"Available", FormatBytes(s.memTotal - s.memUsed) });
-        lines.push_back({ L"Committed", FormatBytes(s.commitTotal) + L" / " + FormatBytes(s.commitLimit) });
-        lines.push_back({ L"", L"Click for Task Manager" });
+    case Mod::Memory: {
+        c.glyph = glyph::Mem;
+        c.title = L"Memory";
+        c.subtitle = FormatBytes(s.memTotal) + L" usable";
+        c.stats.push_back(Stat(Pct(s.memLoad), L"%", L"In use", s.memLoad > 0.9f ? t.hot : kNone));
+        c.stats.push_back(StatOf(FormatBytes(s.memUsed), L"Used"));
+        c.stats.push_back(StatOf(FormatBytes(s.memTotal - s.memUsed), L"Available"));
+        c.hasChart = s.memHistory.size() >= 2;
+        c.chart = { &s.memHistory, nullptr, t.memory, kNone, 1.f, L"Last minute", Fmt(L"avg %.0f%%", Average(s.memHistory) * 100.f) };
+        float commit = s.commitLimit ? (float)((double)s.commitTotal / (double)s.commitLimit) : 0.f;
+        c.meters.push_back({ L"Physical", FormatBytes(s.memUsed) + L" of " + FormatBytes(s.memTotal), s.memLoad, FillColor(t, s.memLoad, t.memory) });
+        c.meters.push_back({ L"Committed", FormatBytes(s.commitTotal) + L" of " + FormatBytes(s.commitLimit), commit, FillColor(t, commit, t.memory) });
+        c.hints = { { L"Click", L"Task Manager" } };
         break;
-    case Mod::Disk:
-        title = L"Storage";
+    }
+    case Mod::Disk: {
+        c.glyph = glyph::Disk;
+        c.title = L"Storage";
+        c.subtitle = s.drives.size() == 1 ? L"1 drive" : Fmt(L"%zu drives", s.drives.size());
         for (auto& d : s.drives) {
-            std::wstring label = Fmt(L"%c:", d.letter) + (d.label.empty() ? L"" : L" " + d.label);
-            lines.push_back({ label, FormatBytes(d.free) + L" free of " + FormatBytes(d.total) });
+            if (!d.total) continue;
+            float used = 1.f - (float)((double)d.free / (double)d.total);
+            std::wstring label = Fmt(L"%c:", d.letter) + (d.label.empty() ? L"" : L"  " + d.label);
+            Color col = used > 0.95f ? t.hot : used > 0.9f ? t.warn : t.disk;
+            c.meters.push_back({ label, FormatBytes(d.free) + L" free of " + FormatBytes(d.total), used, col });
         }
-        lines.push_back({ L"", L"Click to open This PC" });
+        c.hints = { { L"Click", L"This PC" }, { L"Right-click", L"Storage settings" } };
         break;
-    case Mod::Volume:
-        title = audio.deviceName.empty() ? L"Sound" : audio.deviceName;
-        lines.push_back({ L"Volume", audio.muted ? L"Muted" : Fmt(L"%.0f%%", audio.level * 100.f) });
-        lines.push_back({ L"", L"Click mute · Scroll volume · Right-click mixer" });
+    }
+    case Mod::Volume: {
+        c.glyph = audio.muted ? glyph::Mute : glyph::Volume(audio.level);
+        c.title = audio.deviceName.empty() ? L"Sound" : audio.deviceName;
+        c.subtitle = L"Default output";
+        if (audio.muted) { c.badge = L"Muted"; c.badgeColor = t.hot; }
+        c.stats.push_back(Stat(Pct(audio.level), L"%", L"Volume", audio.muted ? t.subtext : kNone));
+        c.meters.push_back({ L"", L"", audio.level, audio.muted ? t.subtext : t.volume });
+        c.hints = { { L"Click", audio.muted ? L"Unmute" : L"Mute" }, { L"Scroll", L"Adjust" }, { L"Right-click", L"Mixer" } };
         break;
+    }
     case Mod::Bluetooth:
-        title = L"Bluetooth";
-        lines.push_back({ L"Status", s.bt.on ? L"On" : L"Off" });
-        if (!s.bt.radioName.empty()) lines.push_back({ L"Adapter", s.bt.radioName });
-        if (s.bt.connected.empty()) lines.push_back({ L"Connected", s.bt.on ? L"No devices" : L"—" });
-        for (size_t i = 0; i < s.bt.connected.size(); ++i) lines.push_back({ i == 0 ? L"Connected" : L"", s.bt.connected[i] });
-        lines.push_back({ L"", L"Click for Bluetooth settings" });
+        c.glyph = glyph::Bt;
+        c.title = L"Bluetooth";
+        c.subtitle = !s.bt.on ? L"Turned off" : s.bt.radioName.empty() ? L"Turned on" : s.bt.radioName;
+        c.badge = s.bt.on ? L"On" : L"Off";
+        c.badgeColor = s.bt.on ? t.bluetooth : t.subtext;
+        if (!s.bt.on) c.accent = t.subtext;
+        if (s.bt.on && s.bt.connected.empty()) c.rows.push_back({ L"Devices", L"None connected" });
+        for (size_t i = 0; i < s.bt.connected.size(); ++i) c.rows.push_back({ i == 0 ? L"Connected" : L"", s.bt.connected[i] });
+        c.hints = { { L"Click", L"Bluetooth settings" } };
         break;
     case Mod::Battery: {
         const BatteryInfo& b = s.battery;
-        title = L"Battery";
-        lines.push_back({ L"Charge", Fmt(L"%d%%", b.percent) });
-        lines.push_back({ L"Status", b.charging ? L"Charging" : b.onAC ? L"Plugged in" : L"On battery" });
-        if (!b.onAC && b.secondsLeft > 0) lines.push_back({ L"Time left", FormatDuration((uint64_t)b.secondsLeft) });
-        lines.push_back({ L"Energy saver", b.saver ? L"On" : L"Off" });
-        lines.push_back({ L"", L"Click for power settings" });
+        float f = b.percent / 100.f;
+        Color col = b.charging || b.onAC ? t.battery : (b.percent <= 15 ? t.hot : (b.percent <= 30 ? t.warn : t.battery));
+        c.glyph = glyph::Battery(b.percent, b.charging);
+        c.accent = col;
+        c.title = L"Battery";
+        c.subtitle = b.saver ? L"Energy saver is on" : L"Energy saver is off";
+        c.badge = b.charging ? L"Charging" : b.onAC ? L"Plugged in" : L"On battery";
+        c.badgeColor = b.charging || b.onAC ? t.battery : t.subtext;
+        c.stats.push_back(Stat(Fmt(L"%d", b.percent), L"%", L"Charge", b.percent <= 15 && !b.onAC ? t.hot : kNone));
+        if (!b.onAC && b.secondsLeft > 0) c.stats.push_back(Stat(FormatDuration((uint64_t)b.secondsLeft), L"", L"Time left"));
+        c.meters.push_back({ L"", L"", f, col });
+        c.hints = { { L"Click", L"Battery settings" } };
         break;
     }
     case Mod::Power:
-        title = L"Power";
-        lines.push_back({ L"", L"Click for the power menu \u00B7 Right-click for a quick list" });
+        c.glyph = glyph::Power;
+        c.title = L"Power";
+        c.subtitle = L"Lock, restart, shut down and more";
+        c.hints = { { L"Click", L"Power menu" }, { L"Right-click", L"Quick list" } };
         break;
     default:
         break;
@@ -1150,8 +1406,171 @@ void App::SetAutostart(bool on) {
     RegCloseKey(k);
 }
 
+// --- pet ---------------------------------------------------------------------------------------
+
+Bar* App::PetBar() const {
+    for (auto& b : bars)
+        if (b->mon.primary) return b.get();
+    return bars.empty() ? nullptr : bars[0].get();
+}
+
+// (Re)builds the pet's sprite when its picture, size or colour changed. GIFs decode on a
+// background thread; the old sprite keeps walking until the new one is ready.
+void App::ApplyPet(bool interactive) {
+    if (interactive) petInteractive_ = true;
+    pet.walk = cfg.petWalk;
+    pet.speed = cfg.petSpeed;
+    pet.facesLeft = cfg.petFacesLeft;
+    Bar* b = PetBar();
+    if (!cfg.petEnabled || !b) {
+        for (auto& bar : bars) bar->PetClear();
+        pet.sprite.reset();
+        pet.Reset();
+        petKey_.clear();
+        ++petGen_;  // drop any decode still running
+        UpdatePetTimer();
+        return;
+    }
+    float dip = cfg.petSize > 0 ? std::min<float>((float)cfg.petSize, cfg.height - 2.f) : cfg.height - 6.f;
+    petPx_ = std::max(8, (int)std::lround(dip * b->Scale()));
+    const Color& ac = cfg.theme.accent;
+    std::wstring key = cfg.petFile.empty()
+        ? Fmt(L"blob|%d|%.3f|%.3f|%.3f|%.3f", petPx_, ac.r, ac.g, ac.b, cfg.theme.background.r)
+        : Fmt(L"file|%d|%d|", petPx_, cfg.petSmooth) + cfg.petFile;
+    if (key == petKey_) {
+        petInteractive_ = false;  // nothing new to load, so nothing to explain later
+        UpdatePetTimer();
+        return;
+    }
+    petKey_ = key;
+    unsigned gen = ++petGen_;
+    if (cfg.petFile.empty()) {
+        auto sp = std::make_shared<PetSprite>();
+        MakeBlobSprite(renderer, petPx_, cfg.theme, *sp);
+        if (!PowerOverlay::IsOpen()) renderer.ReleaseAlphaTarget();
+        pet.sprite = sp;
+        pet.frame = 0;
+        UpdatePetTimer();
+        return;
+    }
+    std::wstring path = cfg.petFile;
+    int px = petPx_, smooth = cfg.petSmooth;
+    HWND target = hwnd;
+    RunInBackground([path, px, smooth, gen, target] {
+        auto* res = new PetLoad;
+        res->ok = LoadPetSprite(path, px, smooth, res->sprite, res->error);
+        if (!PostMessageW(target, WM_APP_PET, gen, (LPARAM)res)) delete res;
+    });
+}
+
+void App::UpdatePetTimer() {
+    PetTick();  // starts, continues or stops the pet's timer as needed
+}
+
+void App::PetTick() {
+    Bar* b = PetBar();
+    bool onBattery = stats.battery.present && !stats.battery.onAC;
+    bool run = cfg.petEnabled && pet.sprite && b && b->visible && sampling_ && !sessionPaused_ &&
+               !(cfg.petPauseOnBattery && onBattery);
+    if (!run) {
+        KillTimer(hwnd, T_PET);
+        for (auto& bar : bars) bar->PetClear();
+        pet.shown = false;
+        return;
+    }
+    double now = NowSeconds();
+    float s = b->Scale(), left = 0, right = 0;
+    bool space = b->PetSpan(cfg.petArea, pet.CenterDip(s), pet.sprite->w / s, left, right);
+    if (pet.Step(now, space, left, right, s, b->pxHeight)) b->PetUpdate();
+    // Walking needs a steady frame rate; a pet that sits still only wakes up for its next frame.
+    UINT next = 1000 / (UINT)cfg.petFps;
+    if (!pet.shown) next = 500;
+    else if (!cfg.petWalk && !pet.Hopping()) next = (UINT)std::clamp(pet.NextFrameIn(now) * 1000.0 + 1.0, 10.0, 1000.0);
+    SetTimer(hwnd, T_PET, next, nullptr);
+}
+
+void App::PetHop() {
+    pet.Hop(NowSeconds());
+    PetTick();
+}
+
+void App::ChoosePetFile() {
+    ComPtr<IFileOpenDialog> dlg;
+    if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dlg)))) return;
+    COMDLG_FILTERSPEC types[] = { { L"Animated GIF", L"*.gif" }, { L"Pictures", L"*.gif;*.png;*.webp;*.bmp" } };
+    dlg->SetFileTypes((UINT)std::size(types), types);
+    dlg->SetTitle(L"Choose a pet for the bar");
+    DWORD opts = 0;
+    dlg->GetOptions(&opts);
+    dlg->SetOptions(opts | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST);
+    if (!cfg.petFile.empty()) {
+        std::wstring dir = cfg.petFile.substr(0, cfg.petFile.find_last_of(L"\\/"));
+        ComPtr<IShellItem> folder;
+        if (SUCCEEDED(SHCreateItemFromParsingName(dir.c_str(), nullptr, IID_PPV_ARGS(&folder)))) dlg->SetFolder(folder.Get());
+    }
+    SetForegroundWindow(hwnd);
+    if (FAILED(dlg->Show(hwnd))) return;
+    ComPtr<IShellItem> item;
+    PWSTR path = nullptr;
+    if (FAILED(dlg->GetResult(&item)) || FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)) || !path) return;
+    std::wstring file = path;
+    CoTaskMemFree(path);
+    cfg.SetValue(L"pet", L"file", file);
+    cfg.SetValue(L"pet", L"enabled", L"1");
+    petInteractive_ = true;
+    ReloadConfig();
+    TrimMemorySoon();  // the dialog loads a lot of shell code we won't need again
+}
+
+// --- colours from the wallpaper -----------------------------------------------------------------
+
+void App::ApplyThemeOverride() {
+    if (fadeStart_ >= 0) { KillTimer(hwnd, T_THEME); fadeStart_ = -1; }
+    iniTheme_ = cfg.theme;
+    if (!cfg.fromWallpaper) {
+        wallThemeValid_ = false;
+        wallSig_.clear();
+        ++wallGen_;
+        return;
+    }
+    if (wallThemeValid_) cfg.theme = wallTheme_;
+}
+
+void App::CheckWallpaper(bool force) {
+    if (!cfg.fromWallpaper || !started_) return;
+    std::wstring sig = WallpaperSignature() + Fmt(L"|tint %d", cfg.wallpaperTint);
+    if (!force && sig == wallSig_) return;
+    wallSig_ = sig;
+    WallpaperSource src = CurrentWallpaper();
+    Theme base = iniTheme_;
+    float tint = cfg.wallpaperTint / 100.f;
+    unsigned gen = ++wallGen_;
+    HWND target = hwnd;
+    RunInBackground([src, base, tint, gen, target] {
+        auto* res = new WallpaperResult;
+        res->ok = ThemeFromWallpaper(src, base, tint, res->theme);
+        if (!PostMessageW(target, WM_APP_WALLPAPER, gen, (LPARAM)res)) delete res;
+    });
+}
+
+void App::StartThemeFade(const Theme& to) {
+    if (!Animations() || !sampling_) {
+        KillTimer(hwnd, T_THEME);
+        fadeStart_ = -1;
+        cfg.theme = to;
+        RenderAll();
+        tip.Refresh();
+        ApplyPet();
+        return;
+    }
+    fadeFrom_ = cfg.theme;
+    fadeTo_ = to;
+    fadeStart_ = NowSeconds();
+    SetTimer(hwnd, T_THEME, 16, nullptr);
+}
+
 void App::ShowContextMenu(POINT pt) {
-    enum { HIDE = 1, FULLSCREEN, REVEAL, AUTOSTART, EDIT, RELOAD, TASKMGR, EXIT };
+    enum { HIDE = 1, FULLSCREEN, REVEAL, AUTOSTART, WALLCOLORS, PET, PETFILE, PETBLOB, EDIT, RELOAD, TASKMGR, EXIT };
     HMENU m = CreatePopupMenu();
     AppendMenuW(m, MF_STRING | MF_GRAYED, 0, L"TopBar " TOPBAR_VERSION);
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
@@ -1162,6 +1581,11 @@ void App::ShowContextMenu(POINT pt) {
     AppendMenuW(m, MF_STRING | (cfg.revealOnHover ? MF_CHECKED : 0) | (cfg.hideInFullscreen ? 0 : MF_GRAYED), REVEAL,
                 L"Peek from the top edge in fullscreen");
     AppendMenuW(m, MF_STRING | (AutostartEnabled() ? MF_CHECKED : 0), AUTOSTART, L"Start with Windows");
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING | (cfg.fromWallpaper ? MF_CHECKED : 0), WALLCOLORS, L"Colours from wallpaper");
+    AppendMenuW(m, MF_STRING | (cfg.petEnabled ? MF_CHECKED : 0), PET, L"Bar pet");
+    AppendMenuW(m, MF_STRING, PETFILE, L"Choose pet GIF...");
+    if (!cfg.petFile.empty()) AppendMenuW(m, MF_STRING, PETBLOB, L"Use the built-in pet");
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, EDIT, L"Edit settings...");
     AppendMenuW(m, MF_STRING, RELOAD, L"Reload settings");
@@ -1188,6 +1612,19 @@ void App::ShowContextMenu(POINT pt) {
         ReloadConfig();  // re-syncs the startup entry
         break;
     }
+    case WALLCOLORS:
+        cfg.SetValue(L"colors", L"from_wallpaper", cfg.fromWallpaper ? L"0" : L"1");
+        ReloadConfig();
+        break;
+    case PET:
+        cfg.SetValue(L"pet", L"enabled", cfg.petEnabled ? L"0" : L"1");
+        ReloadConfig();
+        break;
+    case PETFILE: ChoosePetFile(); break;
+    case PETBLOB:
+        cfg.SetValue(L"pet", L"file", L"");
+        ReloadConfig();
+        break;
     case EDIT:
         if ((INT_PTR)ShellExecuteW(nullptr, L"open", cfg.path.c_str(), nullptr, nullptr, SW_SHOWNORMAL) <= 32)
             ShellExecuteW(nullptr, L"open", L"notepad.exe", (L"\"" + cfg.path + L"\"").c_str(), nullptr, SW_SHOWNORMAL);

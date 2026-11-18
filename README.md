@@ -30,10 +30,20 @@ Modules that don't apply to your PC (no battery, no Bluetooth, no Wi-Fi) hide th
 
 ### Hover for the details
 
-Every module has a live tooltip that keeps updating while it's open. The CPU tooltip shows each
-physical core with one bar per hardware thread.
+Rest the mouse on a module and a card drops down under it. It keeps updating while it's open, and
+moving along the bar glides it from one module to the next.
 
-![Tooltips for CPU, GPU, network, memory, clock and network traffic](docs/tooltips.png)
+- **Big numbers first**, then the detail: usage, clock speed, temperature, speeds and sizes at a glance.
+- **A one-minute history** for CPU, GPU, memory and network traffic (download and upload on one chart).
+- **CPU:** an equalizer with a column for every physical core and a bar for each of its threads.
+- **Clock:** this month's calendar with today marked (and ISO week numbers where weeks start on Monday).
+- **Meters** for memory, video memory, every drive, volume and battery that turn yellow, then red, as they fill.
+- **Hints** at the bottom show what a click, right-click or scroll does.
+
+Each card is tinted with its module's colour, has real rounded corners and a soft shadow, and fades in.
+Turning off *Animation effects* in Windows (or `animations = 0`) makes everything appear instantly.
+
+![Cards for CPU, clock, GPU, storage, network traffic and memory](docs/tooltips.png)
 
 ## Power menu
 
@@ -52,6 +62,40 @@ it springs bigger and its name turns pink. The icons, colours, layout and timing
   background closes the menu.
 - **Suspend on Modern Standby PCs** (most recent laptops) turns the display off, which is how Windows
   itself goes into Modern Standby. The classic sleep call hibernates those PCs instead.
+
+## Bar pet
+
+Right-click the bar and tick **Bar pet**, and a little companion walks back and forth along the empty
+part of the bar. Click it and it hops. It's off until you turn it on.
+
+- **Your own GIF:** choose **Choose pet GIF…** (or set `file =` under `[pet]`). Anime girls, Pokémon,
+  pixel cats, anything animated. GIFs are mirrored when they walk the other way (`faces = left` if
+  yours looks left). Pixel art is enlarged in whole steps so it stays crisp. Bigger pictures are
+  scaled down smoothly.
+- **No GIF?** The built-in blob hops along in your accent colour (and follows your wallpaper colours).
+- It walks in the widest gap (`area = auto`), or only `left` (between your apps and the clock) or
+  `right` (between the clock and the stats). It never walks over a module, and hides when there's no room.
+- `motion = stay` keeps it in one spot. `pause_on_battery = 1` stops it when unplugged.
+
+It stays cheap: each frame redraws only the few hundred pixels around the pet, never the bar.
+The GIF is decoded once into small frames on a background thread. Measured on a 16-thread laptop,
+TopBar used the same CPU with the pet walking as without it (about 0.05% of total CPU either way).
+The pet stops whenever the bar is hidden, such as when a game is fullscreen.
+
+## Colours from your wallpaper
+
+Tick **Colours from wallpaper** (or set `from_wallpaper = 1` under `[colors]`) and the bar takes its
+palette from the desktop picture, like pywal or wallust do for Waybar. Change the wallpaper (or let a
+slideshow change it) and the bar fades to the new colours.
+
+- **The background and pills** take the wallpaper's main colour (or its most vivid one, if the main
+  colour is greyish like clouds or fog). They keep the same lightness steps as the default palette,
+  so everything stays as readable. `wallpaper_tint` (0–100, default 60) sets how strong the tint is.
+- **The icons and accents** take the wallpaper's most vivid colours.
+- Red, yellow and orange keep their meaning (hot, warning, temperature) whatever the wallpaper.
+- The picture is shrunk to 160 pixels and analysed on a background thread, once per wallpaper change.
+  Cloud-only files (OneDrive placeholders) are never downloaded for this; Windows' local copy is used.
+- Turning it off goes back to the colours in `topbar.ini`.
 
 ## Games and movies
 
@@ -80,6 +124,22 @@ again to bring the bar back.
   while the CPU tooltip is open, and GPU engines that sit idle are checked every few seconds instead of every second.
 - Pauses completely when the screen is off or the PC is locked.
 - Uses no internet. The network speed is read from your adapters, not from a speed test.
+- Animations move a finished picture instead of redrawing it: a card sliding in or gliding to the next
+  module costs no drawing at all. Hover fades last 0.14 s and only run while the mouse moves.
+
+## Safe to run
+
+- **No admin rights, no network access, no drivers, no injected code.** It only reads what Windows
+  already exposes to your account.
+- **DLL loading is locked to System32.** TopBar often sits in Downloads next to other files. It never
+  loads a DLL from its own folder (a common way to hijack programs), and it refuses code from network
+  shares or browser-downloaded (low-integrity) locations. Old injection points (AppInit DLLs, global
+  hooks) are switched off for the process.
+- **Pictures are handled carefully.** Pet GIFs must be local files (no network paths, which could leak
+  your Windows sign-in to a server), at most 32 MB and 2048×2048, with caps on frames and memory. They
+  are decoded by Windows' own image codecs on a low-priority background thread. A file that fails
+  any check is explained and the built-in pet is shown instead.
+- Built with Control Flow Guard, CET shadow-stack compatibility, ASLR and DEP.
 
 ## Works on any PC?
 
@@ -131,8 +191,18 @@ reveal_on_hover = 1
 peek_hotkey = Ctrl+Alt+B
 game_apps =                    ; exe names that should always hide the bar, e.g. game.exe
 start_with_windows = 1         ; on by default
+animations = 1                 ; hover fades and card motion
+
+[pet]
+enabled = 0                    ; off by default
+file =                         ; a GIF; empty = the built-in blob
+motion = walk                  ; or: stay
+speed = 24                     ; pixels per second
+area = auto                    ; or: left, right
 
 [colors]
+from_wallpaper = 0             ; 1 = take the palette from the wallpaper
+wallpaper_tint = 60            ; 0 = grey ... 100 = strongly coloured background
 background = #11111b           ; Catppuccin Mocha by default; any #rrggbb works
 ```
 
@@ -172,20 +242,26 @@ Requires Visual Studio 2019 or newer with the **Desktop development with C++** w
 ```
 build.cmd          :: release build -> build\TopBar.exe
 build.cmd debug    :: debug build with symbols
+build.cmd test     :: safe test build -> build\test\TopBar.exe
 ```
 
 Every push is also built by GitHub Actions, and a `v*` tag publishes a release with the exe attached.
 
-To try the power menu safely, compile with `/DTOPBAR_DRY_RUN`: the buttons then only log their choice
-(with `--debug`, to `%TEMP%\topbar.log`) instead of locking, restarting or shutting down, and the
-build leaves the real install's *Start with Windows* entry alone.
+The test build (`/DTOPBAR_DRY_RUN`) is safe to play with: the power menu buttons only log their choice
+(with `--debug`, to `%TEMP%\topbar.log`) instead of locking, restarting or shutting down, and it
+leaves the real install's *Start with Windows* entry alone. It keeps its own `topbar.ini` in
+`build\test`. While it runs, `TopBar.exe --snapshot` saves every hover card as a PNG in
+`%TEMP%\topbar-snap`, which is how `docs/tooltips.png` is made.
 
 Source layout:
 
 | File | Purpose |
 |---|---|
-| `src/app.cpp` | Controller: monitors, timers, fullscreen detection, peek, menus, tooltip text |
-| `src/bar.cpp` | One bar per monitor: appbar, layout, drawing, mouse; tooltip popup |
+| `src/app.cpp` | Controller: monitors, timers, fullscreen detection, peek, menus, what each card shows |
+| `src/bar.cpp` | One bar per monitor: appbar, layout, drawing, mouse, hover fades, drawing the pet |
+| `src/tooltip.cpp` | Hover cards: layout, charts, core grid, calendar, rounded corners and shadow, motion |
+| `src/pet.cpp` | Bar pet: safe GIF decoding (with frame disposal), the built-in blob, walking |
+| `src/wallpaper.cpp` | Colours from the wallpaper: finding the picture, OKLab palette, smooth theme fades |
 | `src/stats.cpp` | CPU (busy time, per-core, clock speed), memory, network, GPU (D3DKMT), temperature, disks, battery, Wi-Fi, Bluetooth |
 | `src/power.cpp` | Power menu (wlogout layout, CSS-curve hover animations, Hyprland-style fade) |
 | `src/audio.cpp` | Default output volume (event driven) |

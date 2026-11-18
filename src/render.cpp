@@ -41,6 +41,8 @@ bool Renderer::CreateTarget(Target& t, bool alpha) {
 }
 
 void Renderer::Shutdown() {
+    roundStroke_.Reset();
+    dotStroke_.Reset();
     for (auto& f : formats_) f.Reset();
     for (auto& e : ellipsis_) e.Reset();
     opaque_ = Target{};
@@ -63,6 +65,12 @@ void Renderer::SetFonts(const Config& cfg) {
     wchar_t locale[LOCALE_NAME_MAX_LENGTH] = L"en-us";
     GetUserDefaultLocaleName(locale, LOCALE_NAME_MAX_LENGTH);
 
+    // Big tooltip numbers use the Display optical size of Segoe UI Variable when the text font is
+    // its Text cut; any other font is used as is.
+    std::wstring display = text;
+    if (text == L"Segoe UI Variable Text" && FamilyExists(dwrite_.Get(), L"Segoe UI Variable Display"))
+        display = L"Segoe UI Variable Display";
+
     struct Spec { const std::wstring* family; DWRITE_FONT_WEIGHT weight; float size; };
     float s = cfg.fontSize;
     const Spec specs[(int)Font::Count] = {
@@ -76,10 +84,17 @@ void Renderer::SetFonts(const Config& cfg) {
         { &iconFamily_, DWRITE_FONT_WEIGHT_NORMAL, 30.f },     // IconHuge
         { &text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 26.f },         // Title
         { &text, DWRITE_FONT_WEIGHT_SEMI_BOLD, 13.5f },        // Label
+        { &text, DWRITE_FONT_WEIGHT_NORMAL, s - 1.5f },        // TipSmall
+        { &text, DWRITE_FONT_WEIGHT_SEMI_BOLD, s - 1.5f },     // TipSmallBold
+        { &text, DWRITE_FONT_WEIGHT_SEMI_BOLD, s - 2.5f },     // TipKey
+        { &display, DWRITE_FONT_WEIGHT_SEMI_BOLD, s + 9.f },   // TipHero
+        { &text, DWRITE_FONT_WEIGHT_SEMI_BOLD, s - 1.f },      // TipUnit
     };
     for (int i = 0; i < (int)Font::Count; ++i) {
         formats_[i].Reset();
         ellipsis_[i].Reset();
+        baselines_[i] = 0;
+        lineHeights_[i] = 0;
         dwrite_->CreateTextFormat(specs[i].family->c_str(), nullptr, specs[i].weight, DWRITE_FONT_STYLE_NORMAL,
                                   DWRITE_FONT_STRETCH_NORMAL, specs[i].size, locale, &formats_[i]);
         if (!formats_[i]) continue;
@@ -172,34 +187,82 @@ void Renderer::Line(D2D1_POINT_2F a, D2D1_POINT_2F b, const Color& c, float widt
     rt_->DrawLine(a, b, brush_, width);
 }
 
-void Renderer::AreaChart(const D2D1_RECT_F& r, const std::vector<float>& values, size_t capacity, const Color& line,
-                         const Color& fill) {
-    if (values.size() < 2 || capacity < 2) return;
+void Renderer::AreaChart(const D2D1_RECT_F& r, const std::vector<float>& values, size_t capacity, float maxValue,
+                         const Color& line, const Color& fillTop, const Color& fillBottom) {
+    if (values.size() < 2 || capacity < 2 || maxValue <= 0) return;
     float w = r.right - r.left, h = r.bottom - r.top;
     float step = w / (float)(capacity - 1);
-    float x0 = r.right - step * (float)(values.size() - 1);
-    auto pt = [&](size_t i) { return D2D1::Point2F(x0 + step * (float)i, r.bottom - h * Clamp01(values[i])); };
+    size_t first = values.size() > capacity ? values.size() - capacity : 0;
+    size_t n = values.size() - first;
+    float x0 = r.right - step * (float)(n - 1);
+    auto pt = [&](size_t i) {
+        return D2D1::Point2F(x0 + step * (float)i, r.bottom - h * Clamp01(values[first + i] / maxValue));
+    };
+    if (!roundStroke_) {
+        D2D1_STROKE_STYLE_PROPERTIES sp = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                                                                      D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND);
+        factory_->CreateStrokeStyle(sp, nullptr, 0, &roundStroke_);
+    }
 
     ComPtr<ID2D1PathGeometry> area, stroke;
     ComPtr<ID2D1GeometrySink> sink;
     if (SUCCEEDED(factory_->CreatePathGeometry(&area)) && SUCCEEDED(area->Open(&sink))) {
         sink->BeginFigure(D2D1::Point2F(x0, r.bottom), D2D1_FIGURE_BEGIN_FILLED);
-        for (size_t i = 0; i < values.size(); ++i) sink->AddLine(pt(i));
+        for (size_t i = 0; i < n; ++i) sink->AddLine(pt(i));
         sink->AddLine(D2D1::Point2F(r.right, r.bottom));
         sink->EndFigure(D2D1_FIGURE_END_CLOSED);
         sink->Close();
-        brush_->SetColor(fill.d2d());
-        rt_->FillGeometry(area.Get(), brush_);
+        D2D1_GRADIENT_STOP stops[2] = { { 0.f, fillTop.d2d() }, { 1.f, fillBottom.d2d() } };
+        ComPtr<ID2D1GradientStopCollection> coll;
+        ComPtr<ID2D1LinearGradientBrush> grad;
+        if (SUCCEEDED(rt_->CreateGradientStopCollection(stops, 2, &coll)) &&
+            SUCCEEDED(rt_->CreateLinearGradientBrush(
+                D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, r.top), D2D1::Point2F(0, r.bottom)), coll.Get(), &grad)))
+            rt_->FillGeometry(area.Get(), grad.Get());
     }
     sink.Reset();
     if (SUCCEEDED(factory_->CreatePathGeometry(&stroke)) && SUCCEEDED(stroke->Open(&sink))) {
         sink->BeginFigure(pt(0), D2D1_FIGURE_BEGIN_HOLLOW);
-        for (size_t i = 1; i < values.size(); ++i) sink->AddLine(pt(i));
+        for (size_t i = 1; i < n; ++i) sink->AddLine(pt(i));
         sink->EndFigure(D2D1_FIGURE_END_OPEN);
         sink->Close();
         brush_->SetColor(line.d2d());
-        rt_->DrawGeometry(stroke.Get(), brush_, 1.5f);
+        rt_->DrawGeometry(stroke.Get(), brush_, 1.6f, roundStroke_.Get());
     }
+}
+
+void Renderer::FillRectGradientV(const D2D1_RECT_F& r, const Color& top, const Color& bottom) {
+    D2D1_GRADIENT_STOP stops[2] = { { 0.f, top.d2d() }, { 1.f, bottom.d2d() } };
+    ComPtr<ID2D1GradientStopCollection> coll;
+    ComPtr<ID2D1LinearGradientBrush> grad;
+    if (FAILED(rt_->CreateGradientStopCollection(stops, 2, &coll)) ||
+        FAILED(rt_->CreateLinearGradientBrush(
+            D2D1::LinearGradientBrushProperties(D2D1::Point2F(0, r.top), D2D1::Point2F(0, r.bottom)), coll.Get(), &grad)))
+        return;
+    rt_->FillRectangle(r, grad.Get());
+}
+
+void Renderer::DottedLine(D2D1_POINT_2F a, D2D1_POINT_2F b, const Color& c, float width) {
+    if (!dotStroke_) {
+        const float dashes[] = { 1.f, 3.f };
+        D2D1_STROKE_STYLE_PROPERTIES sp = D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_FLAT, D2D1_CAP_STYLE_FLAT,
+                                                                      D2D1_CAP_STYLE_FLAT, D2D1_LINE_JOIN_MITER, 10.f,
+                                                                      D2D1_DASH_STYLE_CUSTOM, 0.f);
+        factory_->CreateStrokeStyle(sp, dashes, 2, &dotStroke_);
+    }
+    brush_->SetColor(c.d2d());
+    rt_->DrawLine(a, b, brush_, width, dotStroke_.Get());
+}
+
+float Renderer::Baseline(Font f) {
+    float& b = baselines_[(int)f];
+    if (b > 0) return b;
+    auto layout = Layout(L"Ag", f, 1000.f, 1000.f);
+    DWRITE_LINE_METRICS lm{};
+    UINT32 count = 0;
+    if (!layout || FAILED(layout->GetLineMetrics(&lm, 1, &count)) || count == 0) return LineHeight(f) * 0.78f;
+    b = lm.baseline;  // from the top of the line; a box exactly LineHeight tall starts at the line's top
+    return b;
 }
 
 void Renderer::SetTransform(const D2D1_MATRIX_3X2_F& m) { rt_->SetTransform(m); }
@@ -245,11 +308,14 @@ void Renderer::DrawRun(const TextRun& run, float x, float top, const Color& c) {
 }
 
 float Renderer::LineHeight(Font f) {
+    float& h = lineHeights_[(int)f];
+    if (h > 0) return h;
     auto layout = Layout(L"Ag", f, 1000.f, 1000.f);
     if (!layout) return 16.f;
     DWRITE_TEXT_METRICS m{};
     layout->GetMetrics(&m);
-    return m.height;
+    h = m.height;
+    return h;
 }
 
 ComPtr<IDWriteTextFormat> Renderer::CreateTextFormat(float size, DWRITE_FONT_WEIGHT weight) {

@@ -4,7 +4,11 @@
 
 struct Config;
 
-enum class Font { Text, Bold, Icon, Sub, Tip, TipBold, IconBig, IconHuge, Title, Label, Count };
+enum class Font {
+    Text, Bold, Icon, Sub, Tip, TipBold, IconBig, IconHuge, Title, Label,
+    TipSmall, TipSmallBold, TipKey, TipHero, TipUnit,  // tooltip cards
+    Count
+};
 enum class Align { Left, Center, Right };
 
 // A shaped piece of text, laid out once and drawn (possibly several times) without re-shaping.
@@ -35,9 +39,14 @@ public:
     // Arc from startDeg (0 = 12 o'clock, clockwise) sweeping sweepDeg degrees.
     void Arc(D2D1_POINT_2F c, float radius, float startDeg, float sweepDeg, const Color& col, float width);
     void Line(D2D1_POINT_2F a, D2D1_POINT_2F b, const Color& c, float width);
-    // Filled line chart of values (0..1) right-aligned in r; `capacity` points span the full width.
-    void AreaChart(const D2D1_RECT_F& r, const std::vector<float>& values, size_t capacity, const Color& line,
-                   const Color& fill);
+    // Line chart of values / maxValue right-aligned in r (`capacity` points span the full width),
+    // filled with a vertical gradient from fillTop (at the top of r) to fillBottom.
+    void AreaChart(const D2D1_RECT_F& r, const std::vector<float>& values, size_t capacity, float maxValue,
+                   const Color& line, const Color& fillTop, const Color& fillBottom);
+    void FillRectGradientV(const D2D1_RECT_F& r, const Color& top, const Color& bottom);
+    void DottedLine(D2D1_POINT_2F a, D2D1_POINT_2F b, const Color& c, float width);
+    // Distance from the top of a line of text to its baseline.
+    float Baseline(Font f);
     // Text is vertically centred in r.
     void Text(const std::wstring& s, Font f, const D2D1_RECT_F& r, const Color& c, Align a = Align::Left,
               bool ellipsis = false);
@@ -65,6 +74,11 @@ public:
     unsigned Generation() const { return generation_; }  // bumps when bitmaps must be recreated
     const std::wstring& IconFamily() const { return iconFamily_; }
 
+    // For custom drawing (geometry) while a target is bound.
+    ID2D1Factory* Factory() const { return factory_.Get(); }
+    ID2D1RenderTarget* RT() const { return rt_; }
+    ID2D1SolidColorBrush* Brush() const { return brush_; }
+
 private:
     struct Target {
         ComPtr<ID2D1DCRenderTarget> rt;
@@ -86,6 +100,9 @@ private:
     ComPtr<IDWriteTypography> tabular_;
     ComPtr<IDWriteInlineObject> ellipsis_[(int)Font::Count];
     ComPtr<IDWriteTextFormat> formats_[(int)Font::Count];
+    float baselines_[(int)Font::Count] = {};
+    float lineHeights_[(int)Font::Count] = {};
+    ComPtr<ID2D1StrokeStyle> roundStroke_, dotStroke_;
     std::wstring iconFamily_;
     unsigned generation_ = 1;
     bool drawing_ = false;

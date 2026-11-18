@@ -1,4 +1,5 @@
 #include "common.h"
+#include <objbase.h>
 #include <cstdarg>
 #include <cstdio>
 
@@ -131,6 +132,29 @@ double NowSeconds() {
     LARGE_INTEGER c;
     QueryPerformanceCounter(&c);
     return (double)c.QuadPart / (double)freq.QuadPart;
+}
+
+bool RunInBackground(std::function<void()> job) {
+    auto* fn = new std::function<void()>(std::move(job));
+    auto proc = [](LPVOID arg) -> DWORD {
+        std::unique_ptr<std::function<void()>> f((std::function<void()>*)arg);
+        // Background mode lowers CPU, I/O and memory priority so decoding never competes with games.
+        SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        (*f)();
+        if (SUCCEEDED(hr)) CoUninitialize();
+        return 0;
+    };
+    HANDLE h = CreateThread(nullptr, 256 * 1024, proc, fn, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    if (!h) { delete fn; return false; }
+    CloseHandle(h);
+    return true;
+}
+
+bool SystemAnimationsEnabled() {
+    BOOL on = TRUE;
+    if (!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &on, 0)) return true;
+    return on != FALSE;
 }
 
 bool g_debugLog = false;

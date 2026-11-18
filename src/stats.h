@@ -100,15 +100,18 @@ public:
     // Memory
     uint64_t memTotal = 0, memUsed = 0, commitTotal = 0, commitLimit = 0;
     float memLoad = 0;              // 0..1
+    std::vector<float> memHistory;  // last 60 samples of memLoad
 
     // Network
     double rxRate = 0, txRate = 0;  // bytes/s
     uint64_t rxTotal = 0, txTotal = 0;
+    std::vector<float> rxHistory, txHistory;  // last 60 rates, bytes/s
     NetInfo net;
 
     // GPU
     std::vector<GpuStat> gpus;
     int mainGpu = -1;
+    std::vector<float> gpuHistory;  // last 60 usage samples of the main GPU
     bool sampleAllGpus = false;     // set while every GPU is on screen (gpu = all, or GPU tooltip open)
 
     // Disks

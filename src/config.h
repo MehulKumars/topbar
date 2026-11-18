@@ -37,12 +37,28 @@ struct Config {
     std::vector<std::wstring> gameApps;       // lowercase exe names that always hide the bar
     bool efficiencyMode = true;
     bool startWithWindows = true;             // on by default; unticking it in the menu saves 0
+    bool animations = true;                   // hover / tooltip motion (also off with Windows animations off)
 
     // [clock]
     std::wstring dateFormat = L"ddd d MMM";
     bool clockSeconds = false;
     std::wstring clock24h = L"auto";          // auto | 1 | 0
 
+    // [pet] a small animated companion walking along the empty part of the bar (off by default)
+    bool petEnabled = false;
+    std::wstring petFile;                     // resolved absolute path; empty = the built-in blob
+    bool petWalk = true;                      // motion = walk | stay
+    float petSpeed = 24.f;                    // DIPs per second
+    int petSize = 0;                          // DIPs; 0 = fit the bar
+    int petFps = 30;                          // movement frame rate
+    bool petFacesLeft = false;                // which way the GIF looks
+    std::wstring petArea = L"auto";           // auto | left | right
+    int petSmooth = -1;                       // scaling: -1 auto, 0 crisp pixels, 1 smooth
+    bool petPauseOnBattery = false;
+
+    // [colors]
+    bool fromWallpaper = false;               // derive the palette from the wallpaper (off by default)
+    int wallpaperTint = 60;                   // 0..100: how much colour the background and pills take
     Theme theme;
 
     std::wstring path;                        // where the config was loaded from
@@ -55,6 +71,8 @@ struct Config {
     bool ChangedOnDisk() const;
     // Persist one key (rewrites the line in place, keeping comments).
     void SetValue(const wchar_t* section, const wchar_t* key, const std::wstring& value);
+    // Expands %VARIABLES% and makes a relative path absolute, starting next to the settings file.
+    std::wstring ResolveUserPath(const std::wstring& p) const;
 
     static std::wstring ResolvePath();
 };

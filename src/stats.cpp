@@ -211,8 +211,11 @@ void Stats::SampleFast() {
         cpu = cpuBusy;
         cores = coresBusy;
     }
-    cpuHistory.push_back(cpu);
-    if (cpuHistory.size() > 60) cpuHistory.erase(cpuHistory.begin());
+    auto push = [](std::vector<float>& h, float v) {
+        h.push_back(v);
+        if (h.size() > 60) h.erase(h.begin());
+    };
+    push(cpuHistory, cpu);
 
     // Memory
     MEMORYSTATUSEX ms{ sizeof(ms) };
@@ -223,6 +226,7 @@ void Stats::SampleFast() {
         commitLimit = ms.ullTotalPageFile;
         commitTotal = ms.ullTotalPageFile - ms.ullAvailPageFile;
     }
+    push(memHistory, memLoad);
 
     // Network throughput across physical adapters
     MIB_IF_TABLE2* table = nullptr;
@@ -249,8 +253,11 @@ void Stats::SampleFast() {
         prevRx_ = rx; prevTx_ = tx; prevNetTime_ = now; netBaseline_ = true;
         rxTotal = rx; txTotal = tx;
     }
+    push(rxHistory, (float)rxRate);
+    push(txHistory, (float)txRate);
 
     SampleGpuUsage();
+    if (mainGpu >= 0 && mainGpu < (int)gpus.size()) push(gpuHistory, gpus[mainGpu].usage);
 }
 
 void Stats::SampleSlow() {

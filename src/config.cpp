@@ -55,6 +55,8 @@ game_apps =
 efficiency_mode = 1
 ; Start TopBar automatically when you sign in to Windows (no admin rights needed)
 start_with_windows = 1
+; Hover fades and tooltip motion. Also off when Windows' "Animation effects" are off.
+animations = 1
 
 [clock]
 ; Date pattern: d dd ddd dddd, M MM MMM MMMM, yy yyyy
@@ -63,7 +65,35 @@ seconds = 0
 ; auto = follow Windows, 1 = 24-hour, 0 = 12-hour
 24h = auto
 
+[pet]
+; A little animated companion that walks along the empty part of the bar. Off by default.
+; It costs about as much as a blinking cursor: only the few pixels around it are redrawn.
+enabled = 0
+; A GIF (or PNG) on this PC. Relative paths start next to this file. Empty = the built-in blob,
+; which takes the accent colour. Files over 32 MB or 2048x2048 are refused.
+file =
+; walk = strolls back and forth, stay = sits in the middle of the free space
+motion = walk
+; Walking speed in pixels per second (at 100% scaling)
+speed = 24
+; Height in pixels at 100% scaling. 0 = fit the bar.
+size = 0
+; Movement frames per second, 10..60 (the GIF keeps its own frame timing)
+fps = 30
+; Which way the GIF faces: right or left. It is mirrored when walking the other way.
+faces = right
+; auto = the widest empty space, left = between the apps and the clock, right = between the clock and the stats
+area = auto
+; auto = crisp pixels when enlarging (pixel art), smooth when shrinking. 1 = always smooth, 0 = always crisp.
+smooth = auto
+pause_on_battery = 0
+
 [colors]
+; 1 = take the colours below from the wallpaper (like pywal / wallust) and follow it when it changes:
+; the background and pills take its main colour, the icons its most vivid colours
+from_wallpaper = 0
+; How much of the wallpaper's colour the background and pills take: 0 = grey ... 100 = strong
+wallpaper_tint = 60
 background = #11111b
 pill = #1e1e2e
 pill_hover = #313244
@@ -280,12 +310,38 @@ bool Config::Load() {
     list(L"behavior.game_apps", gameApps, true);
     boolean(L"behavior.efficiency_mode", efficiencyMode);
     boolean(L"behavior.start_with_windows", startWithWindows);
+    boolean(L"behavior.animations", animations);
 
     str(L"clock.date_format", dateFormat);
     boolean(L"clock.seconds", clockSeconds);
     str(L"clock.24h", clock24h);
     clock24h = ToLower(clock24h);
 
+    boolean(L"pet.enabled", petEnabled);
+    str(L"pet.file", petFile);
+    petFile = ResolveUserPath(petFile);
+    {
+        std::wstring v;
+        str(L"pet.motion", v);
+        if (!v.empty()) petWalk = ToLower(v) != L"stay";
+        v.clear();
+        str(L"pet.faces", v);
+        if (!v.empty()) petFacesLeft = ToLower(v) == L"left";
+        v.clear();
+        str(L"pet.smooth", v);
+        v = ToLower(v);
+        if (v == L"1" || v == L"yes" || v == L"on" || v == L"true") petSmooth = 1;
+        else if (v == L"0" || v == L"no" || v == L"off" || v == L"false") petSmooth = 0;
+    }
+    flt(L"pet.speed", petSpeed, 0.f, 400.f);
+    num(L"pet.size", petSize, 0, 80);
+    num(L"pet.fps", petFps, 10, 60);
+    str(L"pet.area", petArea);
+    petArea = ToLower(petArea);
+    boolean(L"pet.pause_on_battery", petPauseOnBattery);
+
+    boolean(L"colors.from_wallpaper", fromWallpaper);
+    num(L"colors.wallpaper_tint", wallpaperTint, 0, 100);
     color(L"colors.background", theme.background);
     color(L"colors.pill", theme.pill);
     color(L"colors.pill_hover", theme.pillHover);
@@ -307,6 +363,24 @@ bool Config::Load() {
     color(L"colors.warn", theme.warn);
     color(L"colors.power", theme.power);
     return true;
+}
+
+std::wstring Config::ResolveUserPath(const std::wstring& in) const {
+    std::wstring p = Trim(in);
+    if (p.size() >= 2 && p.front() == L'"' && p.back() == L'"') p = p.substr(1, p.size() - 2);
+    if (p.empty()) return p;
+    wchar_t buf[MAX_PATH * 2];
+    DWORD n = ExpandEnvironmentStringsW(p.c_str(), buf, _countof(buf));
+    if (n > 0 && n <= _countof(buf)) p = buf;
+    bool absolute = (p.size() >= 3 && iswalpha(p[0]) && p[1] == L':' && (p[2] == L'\\' || p[2] == L'/')) ||
+                    (p.size() >= 2 && (p[0] == L'\\' || p[0] == L'/') && (p[1] == L'\\' || p[1] == L'/'));
+    if (!absolute) {
+        size_t slash = path.find_last_of(L"\\/");
+        p = (slash == std::wstring::npos ? ExeDirectory() : path.substr(0, slash)) + L"\\" + p;
+    }
+    n = GetFullPathNameW(p.c_str(), _countof(buf), buf, nullptr);
+    if (n > 0 && n < _countof(buf)) p = buf;
+    return p;
 }
 
 void Config::SetValue(const wchar_t* sectionName, const wchar_t* key, const std::wstring& value) {
