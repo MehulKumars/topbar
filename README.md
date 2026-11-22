@@ -198,3 +198,7 @@ Source layout:
 
 The power menu icons are the wlogout icons from [JaKooLit's Hyprland-Dots](https://github.com/JaKooLit/Hyprland-Dots)
 (GPL-3.0), unchanged.
+
+## License
+
+TopBar is licensed under the [GNU GPL v3.0](LICENSE), the same licence as the power menu icons it uses.
